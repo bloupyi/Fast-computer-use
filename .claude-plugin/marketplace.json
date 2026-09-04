@@ -1,5 +1,6 @@
 {
-  "owner": "noa.pret@gmail.com",
+  "name": "fast-computer-use-marketplace",
+  "owner": "bloup",
   "plugins": [
     {
       "name": "fast-computer-use",
