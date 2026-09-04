@@ -1,14 +1,10 @@
 {
-  "name": "fast-computer-use-marketplace",
-  "owner": "bloup",
-  "plugins": [
-    {
-      "name": "fast-computer-use",
-      "version": "1.0.0",
-      "description": "High-performance native Windows automation engine for computer use. Sub-40ms screen capture, instant UI inspection, hardware-level input, and batch action pipelines.",
-      "author": "bloup",
-      "license": "MIT",
-      "keywords": ["automation", "windows", "computer-use", "screenshot", "ui-automation", "mcp"]
-    }
-  ]
+  "name": "fast-computer-use",
+  "version": "1.0.0",
+  "description": "High-performance native Windows automation engine for computer use. Sub-40ms screen capture, instant UI inspection, hardware-level input, and batch action pipelines.",
+  "author": "bloup",
+  "license": "MIT",
+  "repository": "https://github.com/bloupyi/Fast-computer-use.git",
+  "keywords": ["automation", "windows", "computer-use", "screenshot", "ui-automation", "mcp"],
+  "categories": ["automation", "computer-use", "developer-tools"]
 }
