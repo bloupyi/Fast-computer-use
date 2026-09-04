@@ -25,10 +25,47 @@ Windows APIs (GDI, SendInput, UIAutomation)
 
 ## Installation
 
-The plugin is automatically installed when placed in the local-plugins marketplace at:
+### Local Installation (recommended for development)
+
+Clone the repository and place it in your Claude Code local plugins directory:
+
+```bash
+cd %USERPROFILE%\.claude\local-plugins
+git clone https://github.com/bloupyi/Fast-computer-use.git
 ```
-C:\Users\bloup\.claude\local-plugins\fast-computer-use\
+
+Then restart Claude Code. The plugin will be automatically discovered and loaded.
+
+### Via Claude CLI
+
+If the plugin is published to the marketplace, install it with:
+
+```bash
+claude plugin install fast-computer-use
 ```
+
+Or enable it in your `.mcp.json` configuration file at `~/.claude/.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "fast-computer-use": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["path/to/server/index.mjs"],
+      "env": {
+        "ENGINE_PATH": "path/to/bin/FastEngine.exe"
+      }
+    }
+  }
+}
+```
+
+### Requirements
+
+- **Windows 10/11** (native Win32 API dependency)
+- **.NET Framework 4.8** (for the C# daemon)
+- **Node.js 18+** (for the MCP server)
 
 ## Available MCP Tools
 
@@ -151,12 +188,6 @@ Rebuild `bin/FastEngine.exe` first (`.\bin\build.ps1`) if you've changed
 - **UI tree inspection**: <100ms
 - **Clipboard paste (large code)**: <10ms
 - **Daemon command dispatch**: <2ms
-
-## Requirements
-
-- Windows 10/11
-- .NET Framework 4.8
-- Node.js 18+ (for MCP server)
 
 ## License
 
