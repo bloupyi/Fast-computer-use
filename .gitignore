@@ -1,0 +1,9 @@
+# Autopilot working state (build-process bookkeeping, not shipped content)
+.autopilot/
+
+# Local-only Claude Code session settings
+.claude/settings.local.json
+
+node_modules/
+*.log
+Thumbs.db

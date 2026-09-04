@@ -1,0 +1,9 @@
+{
+  "name": "fast-computer-use-server",
+  "version": "1.0.0",
+  "description": "High-performance Model Context Protocol server for native Windows desktop automation",
+  "main": "index.mjs",
+  "type": "module",
+  "author": "bloup",
+  "license": "MIT"
+}

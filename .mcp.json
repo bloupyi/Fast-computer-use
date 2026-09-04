@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "fast-computer-use": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/server/index.mjs"],
+      "env": {
+        "ENGINE_PATH": "${CLAUDE_PLUGIN_ROOT}/bin/FastEngine.exe"
+      },
+      "description": "Native Windows automation engine - sub-40ms screen capture, Win32 input virtualization, and UI Automation tree inspection"
+    }
+  }
+}
