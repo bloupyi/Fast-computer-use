@@ -4,154 +4,130 @@ description: Display Fast Computer Use plugin help and command reference
 
 # Fast Computer Use Plugin
 
-High-performance native Windows automation plugin for computer use. Replaces slow, token-heavy ad-hoc PowerShell scripts with a native C# automation engine delivering sub-40ms screen capture, instant UI element inspection, hardware-level input, and batch action pipelines.
+Native Windows automation for Claude Code: hardware-level input, sub-40ms screen
+capture, UI Automation inspection, and self-verifying action pipelines.
 
-## Available Commands
+## The one thing to know
 
-### `/fast-screen` - High-Speed Screenshot
-Capture screenshots with sub-40ms performance, optional downscaling to reduce visual tokens by up to 75%, multi-monitor support, and ROI cropping.
+The engine dispatches a command in about 2 ms. Slowness never comes from the
+machine - it comes from issuing one tool call per action with a screenshot in
+between. **Plan the sequence, send it as one `batch_actions` call, and let each
+step prove itself in text.**
 
-**Usage:**
+```json
+{
+  "actions": [
+    {"cmd": "launch", "app": "notepad", "timeout_ms": 8000},
+    {"cmd": "ui_click", "control_type": "Document"},
+    {"cmd": "keyboard", "action": "type_text", "text": "hello world"},
+    {"cmd": "read_text", "control_type": "Document", "expect": "hello world"}
+  ]
+}
 ```
-/fast-screen [--screen N] [--max-dim N] [--active] [--roi x,y,w,h] [--format jpeg|png] [--quality N] [--save PATH]
+
+One call, about 190 ms, verified - no screenshot. The same task issued step by
+step takes minutes.
+
+## Commands
+
+### `/fast-do` - drive a whole task
+
+```
+/fast-do <what you want done on the desktop>
 ```
 
-**Examples:**
-- `/fast-screen` - Capture primary monitor
-- `/fast-screen --screen 1 --max-dim 1024` - Capture monitor 1, downscaled to 1024px
-- `/fast-screen --active --max-dim 1280` - Capture active window only
-- `/fast-screen --roi 0,0,800,600` - Capture region of interest
+Runs a multi-step task through a dedicated two-model workflow: the repetitive
+action loop goes to a fast model, while reading source, understanding an
+unfamiliar app and recovering from surprises stay on the heavy model. Use it for
+anything that needs more than one batch.
 
----
+### `/fast-screen` - screenshot
 
-### `/fast-inspect` - UI Automation Tree Inspector
-Inspect Windows UI Automation accessibility tree to discover interactive controls with pre-calculated click coordinates. Eliminates coordinate guessing.
+```
+/fast-screen [--panorama] [--screen N] [--max-dim N] [--active] [--roi x,y,w,h] [--format jpeg|png] [--quality N] [--save PATH]
+```
 
-**Usage:**
+- `/fast-screen --panorama` - every monitor stitched into one labelled image, each
+  with its own resolution budget, plus the map to convert a panorama point back to
+  desktop coordinates. This is the multi-monitor option.
+- `/fast-screen --active --max-dim 1280` - active window only
+- `/fast-screen --roi 0,0,800,600` - region of interest
+
+### `/fast-inspect` - find controls without looking
+
 ```
 /fast-inspect [--target active_window|cursor|screen] [--depth N] [--filter TEXT] [--all]
 ```
 
-**Examples:**
-- `/fast-inspect` - Inspect active window
-- `/fast-inspect --filter "Submit"` - Find Submit button coordinates
-- `/fast-inspect --target cursor` - Inspect element under cursor
-- `/fast-inspect --target screen --all` - Full screen scan including non-interactive
+Returns control names, automation ids and exact click coordinates. Prefer this
+over a screenshot whenever the question is "is it there / where is it".
 
----
+### `/fast-click` - one native click
 
-### `/fast-click` - Native Mouse Click
-Execute hardware-accurate Win32 mouse clicks at specified screen coordinates.
-
-**Usage:**
 ```
 /fast-click <x> <y> [--double] [--triple] [--right] [--middle] [--smooth]
 ```
 
-**Examples:**
-- `/fast-click 500 300` - Left-click at (500, 300)
-- `/fast-click 800 600 --double` - Double-click
-- `/fast-click 120 80 --right` - Right-click
-- `/fast-click 400 400 --smooth` - Smooth cursor movement
+For a sequence, use `batch_actions` instead - and prefer `ui_click` with an
+`automation_id` or `name` over raw coordinates, since those survive a moved window.
 
----
-
-### `/fast-type` - Native Keyboard Input
-Type text, execute hotkeys, or paste large blocks instantly via clipboard.
-
-**Usage:**
-```
-/fast-type <text_or_hotkey> [--paste] [--delay N]
-```
-
-**Examples:**
-- `/fast-type "Hello, world!"` - Type text
-- `/fast-type ctrl+c` - Execute Copy hotkey
-- `/fast-type "const x = 42;\nconsole.log(x);" --paste` - Instant paste (<10ms)
-- `/fast-type win+r` - Open Run dialog
-
----
-
-## MCP Tools (for direct invocation)
-
-When computer use is enabled, you also have direct access to these MCP tools:
-
-- **`screen_capture`** - Screenshot with downscaling, ROI, multi-monitor
-- **`ui_inspect`** - UI Automation tree with clickable coordinates
-- **`mouse_action`** - Click, double-click, drag, scroll, move
-- **`keyboard_action`** - Type, paste, hotkeys, key presses
-- **`batch_actions`** - Execute multi-step sequences atomically
-- **`window_manager`** - List, focus, move, resize, close windows
-- **`system_info`** - Display configs, cursor position, active window
-
-## Typical Workflow
-
-1. **Take a screenshot** to see the current state:
-   ```
-   /fast-screen --max-dim 1280
-   ```
-
-2. **Inspect UI elements** to find exact click coordinates:
-   ```
-   /fast-inspect --filter "Submit"
-   ```
-
-3. **Click the button** using the discovered coordinates:
-   ```
-   /fast-click 652 428
-   ```
-
-4. **Type or paste text** into input fields:
-   ```
-   /fast-type "user@example.com" --paste
-   ```
-
-5. **Execute hotkeys** for keyboard shortcuts:
-   ```
-   /fast-type ctrl+s
-   ```
-
-## Performance
-
-- **Screen capture**: Sub-40ms (downscaled), ~72ms typical
-- **UI inspection**: <100ms
-- **Mouse click**: ~0ms dispatch
-- **Clipboard paste**: <10ms for large blocks
-- **Daemon command**: Sub-2ms latency
-
-## Requirements
-
-- Windows 10/11
-- .NET Framework 4.8
-- Node.js 18+ (for MCP server)
-
-## Architecture
+### `/fast-type` - keyboard input
 
 ```
-User Request / Computer Use
-    ↓
-MCP Server (Node.js)
-    ↓ stdio JSON-RPC
-Native Engine (C# .NET 4.8)
-    ↓
-Windows APIs (GDI, SendInput, UIAutomation)
+/fast-type <text> [--paste] [--hotkey COMBO] [--key KEY] [--delay N]
 ```
 
-## Tips
+`--paste` injects through the clipboard in under 10 ms; use it for anything long.
 
-- Use `--max-dim 1024` or `1280` to reduce visual token usage by up to 75% while maintaining legibility
-- Combine `/fast-inspect` + `/fast-click` to eliminate coordinate guessing
-- Use `--paste` mode for large code blocks or multiline text (10x faster than typing)
-- Batch multiple actions together for atomic execution without round-trip latency (a `{"cmd": "wait", "ms": N}` item pauses between steps)
-- `window_manager`'s `restore` un-minimizes a window but does not take keyboard focus back — call `focus` explicitly before typing/clicking into a window you just restored
+## MCP tools
 
-## Testing
+| tool | use it for |
+|---|---|
+| `batch_actions` | **the default.** A whole sequence in one call, halting at the first failure |
+| `app_launch` | start an app and wait for its real window, with the true failure reason on error |
+| `wait_for` | block until an element or window appears / disappears |
+| `read_text` | read a control's real content and assert it, instead of screenshotting |
+| `ui_inspect` | controls with automation ids and click coordinates |
+| `screen_capture` | pixels: one monitor, active window, ROI, or `panorama: true` |
+| `mouse_action` | a genuine one-off click, move, drag or scroll |
+| `keyboard_action` | a genuine one-off type, paste, hotkey or key press |
+| `window_manager` | list, focus (verified), minimize, maximize, restore, close, move |
+| `system_info` | monitor layout, cursor, active window |
 
-Run `node server/smoke-test.mjs` from the plugin root to exercise all 7 MCP
-tools against the real server and native engine end to end. Exit code 0 means
-every check passed.
+## Verifying instead of looking
 
----
+Attach `verify` to any batch step:
 
-For more details, see the README at:
-`C:\Users\bloup\.claude\local-plugins\fast-computer-use\README.md`
+| form | meaning |
+|---|---|
+| `"Save"` | a UI element matching this must be present afterwards |
+| `true` | report the foreground window after the step |
+| `{"mode":"text","filter":"104","expect":"hi"}` | read a control back and assert its content |
+
+A batch halts at the first failed step, so a failed focus never sends the
+following keystrokes into the wrong window. `continue_on_error: true` opts out.
+
+Screenshots are for pixels - an image, a canvas, a layout question. For facts,
+`ui_inspect` and `read_text` answer in text at a fraction of the token cost.
+
+## Multi-monitor
+
+Call `system_info` once for the layout. Then `screen_capture` with
+`panorama: true`. To click something spotted in a panorama, convert first:
+
+```
+desktop_x = screen.bounds.x + (pano_x - screen.dest.x) / screen.scale
+```
+
+## Troubleshooting
+
+- **An app will not start**: `app_launch` returns the actual reason, read out of
+  the Windows error dialog. A missing DLL there is a broken installation on the
+  host, not a plugin problem.
+- **Input lands in the wrong window**: never bypass the default halt-on-failure.
+  Start batches with `window_focus`, which confirms the window really reached the
+  foreground.
+- **A batch step reports `Unknown command`**: the `cmd` is not one the engine
+  knows. Check the spelling against the table above.
+- **Rebuild after editing the engine**: `.\bin\build.ps1`, then
+  `node server/smoke-test.mjs` (exit code 0 = everything passed).

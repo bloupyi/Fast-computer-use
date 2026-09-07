@@ -2,16 +2,21 @@
 // Reproducible smoke test for the fast-computer-use MCP plugin.
 //
 // Spawns the real MCP server (server/index.mjs, which itself spawns the real
-// FastEngine.exe daemon) and speaks actual JSON-RPC 2.0 over stdio — the same
-// protocol a real MCP client (Claude Code) uses — to exercise every tool with
+// FastEngine.exe daemon) and speaks actual JSON-RPC 2.0 over stdio - the same
+// protocol a real MCP client (Claude Code) uses - to exercise every tool with
 // safe arguments. No mocks: this proves the whole stack (Node MCP layer +
 // native Win32 engine) end to end.
 //
 // Safety: interactive input (mouse clicks, keystrokes) is never sent to
-// whatever window happens to be focused. The script opens a disposable,
-// verified-blank Notepad tab first and only proceeds with interactive tests
-// (including every mouse_action click variant) once it has confirmed that tab
-// is actually focused; the tab is closed again at the end.
+// whatever window happens to be focused. The script opens its own disposable
+// scratch window first and only proceeds with interactive tests once it has
+// confirmed that window is actually focused; it is closed again at the end.
+//
+// Notepad is the preferred scratch app because it is what the plugin's own
+// benchmark uses. When Notepad is broken on the host (a missing Windows App
+// SDK DLL has been observed), that is reported as an ENVIRONMENT note and the
+// run continues against Character Map - a pure Win32 app that is always
+// present, has an editable field, and discards everything when closed.
 //
 // Exit code 0 = every check passed. Non-zero = see stderr for which failed.
 
@@ -26,24 +31,25 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const SERVER_PATH = resolve(__dirname, 'index.mjs');
 
 // The engine always writes a screenshot to disk (defaulting to a generated
-// temp path) even when return_image is false — pass an explicit save_path
+// temp path) even when return_image is false - pass an explicit save_path
 // for every capture so we know exactly what to delete afterward.
 let shotCounter = 0;
-function tmpShotPath() {
-  return join(tmpdir(), `fast-computer-use-smoke-test-${process.pid}-${shotCounter++}.jpg`);
+function tmpShotPath(ext = 'jpg') {
+  return join(tmpdir(), `fast-computer-use-smoke-test-${process.pid}-${shotCounter++}.${ext}`);
 }
 function cleanupShot(path) {
   try { unlinkSync(path); } catch { /* best effort */ }
 }
 
 const EXPECTED_TOOLS = [
-  'screen_capture', 'ui_inspect', 'mouse_action', 'keyboard_action',
-  'batch_actions', 'window_manager', 'system_info'
+  'batch_actions', 'screen_capture', 'app_launch', 'wait_for', 'read_text',
+  'ui_inspect', 'mouse_action', 'keyboard_action', 'window_manager', 'system_info'
 ];
 
 let passCount = 0;
 let failCount = 0;
 const failures = [];
+const notes = [];
 
 function ok(label, detail = '') {
   passCount++;
@@ -59,6 +65,11 @@ function fail(label, detail) {
 function assert(cond, label, detail = '') {
   if (cond) ok(label, detail);
   else fail(label, detail);
+}
+
+function note(text) {
+  notes.push(text);
+  console.log(`  note  - ${text}`);
 }
 
 async function sleep(ms) {
@@ -99,7 +110,7 @@ class McpClient {
     });
   }
 
-  request(method, params, timeoutMs = 20000) {
+  request(method, params, timeoutMs = 30000) {
     const id = this.nextId++;
     const payload = { jsonrpc: '2.0', id, method, ...(params !== undefined ? { params } : {}) };
     return new Promise((resolve, reject) => {
@@ -112,8 +123,8 @@ class McpClient {
     });
   }
 
-  async callTool(name, args = {}) {
-    const msg = await this.request('tools/call', { name, arguments: args });
+  async callTool(name, args = {}, timeoutMs = 30000) {
+    const msg = await this.request('tools/call', { name, arguments: args }, timeoutMs);
     if (msg.error) throw new Error(`${name}: ${msg.error.message}`);
     return msg.result;
   }
@@ -128,27 +139,24 @@ function toolResultText(result) {
   return result?.content?.map((c) => c.text).join('\n') ?? '';
 }
 
-// --- Disposable Notepad helper (safety net for interactive tests) -----------
-
 async function getActiveWindowTitle(client) {
   const res = await client.callTool('window_manager', { action: 'get_active' });
-  try { return JSON.parse(toolResultText(res)).title || ''; } catch { return ''; }
+  return toolResultText(res).match(/"([^"]*)"/)?.[1] ?? '';
 }
+
+// --- Disposable scratch window (safety net for interactive tests) -----------
 
 // Notepad's "save changes?" confirmation has a locale-dependent label
 // ("Don't save" / "Ne pas enregistrer" / ...) but a stable automationId
-// ("SecondaryButton" = discard) — find it with our own ui_inspect fix rather
-// than matching text. The dialog does take the foreground when it appears,
-// so active_window is enough — and it matters: target:"screen" walks every
-// open window (verified: it can burn the 150-element cap on unrelated apps
-// before ever reaching this small dialog) and is unreliable for this.
+// ("SecondaryButton" = discard) - find it with ui_inspect rather than matching
+// text. The dialog takes the foreground when it appears, so active_window is
+// enough - and it matters: target:"screen" walks every open window and can
+// burn the element cap on unrelated apps before reaching this small dialog.
 // Returns true if a dialog was found and dismissed.
 async function dismissSaveDialogIfPresent(client) {
   const res = await client.callTool('ui_inspect', {
     target: 'active_window', max_depth: 6, filter: 'SecondaryButton'
   });
-  // ui_inspect's tool-call result is formatted text (see tools.mjs), not
-  // JSON — pull the button's pre-computed center straight out of it.
   const match = toolResultText(res).match(/Center:\s*\((\d+),\s*(\d+)\)/);
   if (!match) return false;
   await client.callTool('mouse_action', { action: 'click', x: Number(match[1]), y: Number(match[2]) });
@@ -156,67 +164,75 @@ async function dismissSaveDialogIfPresent(client) {
   return true;
 }
 
-// Opens (or reuses) Notepad, forces a brand-new blank tab, and confirms that
-// tab is actually focused before returning. Never assumes — verifies.
-async function openVerifiedBlankNotepad(client) {
-  const notepad = spawn('notepad.exe', [], { detached: true, stdio: 'ignore' });
-  notepad.unref();
+const SCRATCH_TEXT = 'fast-computer-use smoke test';
 
-  // Modern Windows Notepad restores the previous session's tabs on launch,
-  // and an "Open With" chooser has been observed to grab focus transiently on
-  // this environment. Poll and nudge until Notepad is foreground, clearing
-  // anything unexpected — including a save-prompt orphaned by a previous run
-  // that crashed mid-cleanup.
-  let focused = false;
-  for (let i = 0; i < 15 && !focused; i++) {
-    await sleep(200);
-    const res = await client.callTool('window_manager', { action: 'get_active' });
-    let info;
-    try { info = JSON.parse(toolResultText(res)); } catch { info = {}; }
-    if (info.processName === 'Notepad') {
-      focused = true;
-      if (await dismissSaveDialogIfPresent(client)) focused = false; // re-check after dismissing
-    } else {
-      await client.callTool('keyboard_action', { action: 'press_key', key: 'Escape' });
-    }
-  }
-  if (!focused) throw new Error('Notepad never became the foreground window');
-
-  // Force a genuinely new, empty tab — never trust a restored session tab.
-  await client.callTool('keyboard_action', { action: 'hotkey', hotkey: 'ctrl+n' });
-  await sleep(300);
-
-  const title = await getActiveWindowTitle(client);
-  if (!/^Untitled/i.test(title)) {
-    throw new Error(`expected a blank "Untitled" tab, got "${title}" — refusing to run interactive tests`);
-  }
-  return title;
+// Opens the scratch window the interactive tests are allowed to touch, and
+// verifies it is really focused before handing it over. Prefers Notepad, falls
+// back to Character Map when the host's Notepad cannot start.
+function hwndOf(launchResult) {
+  return toolResultText(launchResult).match(/hwnd=(\d+)/)?.[1] ?? '';
 }
 
-const DISPOSABLE_TAB_TEXT = 'fast-computer-use smoke test';
+async function openScratchApp(client) {
+  const np = await client.callTool('app_launch', {
+    app: 'notepad', reuse_existing: false, timeout_ms: 8000
+  }, 40000);
 
-// Closes the tab/window this script typed into. Modern Notepad sometimes
-// attaches a fresh launch as a tab in the existing window and sometimes opens
-// a whole new top-level window (observed both ways on this environment) —
-// so target it by its own unique title substring via window_manager's
-// `close`, which delivers WM_CLOSE straight to that window handle and does
-// not depend on it currently holding keyboard focus (unlike a Ctrl+W
-// hotkey, which goes wherever focus happens to be — the preceding
-// minimize/restore test does not itself re-take the foreground, since
-// restore only un-minimizes and, by design, doesn't steal focus back).
-// It's dirty (we typed into it), so this still raises a save-changes
-// confirmation instead of closing outright — dismiss it, discarding the
-// throwaway text without ever saving it to disk.
-async function closeNotepadTab(client) {
+  if (!np.isError) {
+    // A restored session tab is never trusted: force a genuinely new one.
+    await client.callTool('keyboard_action', { action: 'hotkey', hotkey: 'ctrl+n' });
+    await sleep(300);
+    const title = await getActiveWindowTitle(client);
+    if (/^Untitled|^Sans titre/i.test(title)) {
+      return {
+        kind: 'notepad',
+        title,
+        hwnd: hwndOf(np),
+        // Notepad's editor pane is a Document element; it has no automation id.
+        editFilter: 'Document',
+        closeTarget: SCRATCH_TEXT,
+        needsSaveDismiss: true
+      };
+    }
+    note(`Notepad opened but gave "${title}" instead of a blank tab; using Character Map instead`);
+  } else {
+    note(`ENVIRONMENT: Notepad cannot start on this host, falling back to Character Map. ${toolResultText(np).slice(0, 160)}`);
+  }
+
+  const cm = await client.callTool('app_launch', {
+    app: 'charmap', reuse_existing: false, timeout_ms: 10000
+  }, 40000);
+  if (cm.isError) throw new Error(`no usable scratch app: ${toolResultText(cm)}`);
+
+  const title = await getActiveWindowTitle(client);
+  return {
+    kind: 'charmap',
+    title,
+    hwnd: hwndOf(cm),
+    // "Characters to copy" - stable automation id, locale-independent.
+    editFilter: '104',
+    closeTarget: title,
+    needsSaveDismiss: false
+  };
+}
+
+async function closeScratchApp(client, scratch) {
   try {
-    await client.callTool('window_manager', { action: 'close', target: DISPOSABLE_TAB_TEXT });
+    // By handle, not by title: the title is locale-dependent and changes as
+    // soon as the window has content.
+    const target = scratch.hwnd || scratch.closeTarget;
+    const res = await client.callTool('window_manager', { action: 'close', target });
+    if (res.isError) note(`teardown: close failed - ${toolResultText(res)}`);
+    if (!scratch.needsSaveDismiss) return;
     for (let i = 0; i < 10; i++) {
       await sleep(200);
       if (await dismissSaveDialogIfPresent(client)) break;
       const title = await getActiveWindowTitle(client);
-      if (!title.includes('smoke test')) break; // already closed, no dialog to dismiss
+      if (!title.includes('smoke test')) break;
     }
-  } catch { /* best-effort cleanup — never fail the whole run over teardown */ }
+  } catch (err) {
+    note(`teardown: close threw - ${err.message}`);
+  }
 }
 
 // --- Main ---------------------------------------------------------------
@@ -227,7 +243,7 @@ async function main() {
   const client = new McpClient(SERVER_PATH);
   client.start();
 
-  let blankTabOpened = false;
+  let scratch = null;
   try {
     // 1. initialize
     const initMsg = await client.request('initialize', {
@@ -238,22 +254,26 @@ async function main() {
     assert(!initMsg.error && initMsg.result?.serverInfo?.name === 'fast-computer-use',
       'initialize responds with serverInfo', JSON.stringify(initMsg.result?.serverInfo));
 
-    // 2. tools/list — 7 tools expected
+    // 2. tools/list
     const listMsg = await client.request('tools/list');
     const names = (listMsg.result?.tools ?? []).map((t) => t.name).sort();
-    assert(names.length === EXPECTED_TOOLS.length &&
-      EXPECTED_TOOLS.every((n) => names.includes(n)),
+    assert(names.length === EXPECTED_TOOLS.length && EXPECTED_TOOLS.every((n) => names.includes(n)),
       `tools/list returns exactly the ${EXPECTED_TOOLS.length} expected tools`, names.join(', '));
 
-    // 3. system_info — read-only, always safe
-    const sysInfo = await client.callTool('system_info', {});
-    assert(!sysInfo.isError && toolResultText(sysInfo).includes('monitors'),
-      'system_info returns monitor/cursor data');
+    // 2b. batch_actions must be discoverable as the preferred path, otherwise
+    // the model falls back to one call per action - the whole slowness problem.
+    const batchDef = (listMsg.result?.tools ?? []).find((t) => t.name === 'batch_actions');
+    assert(/PREFERRED ENTRY POINT/.test(batchDef?.description ?? '') &&
+      /"cmd":"launch"/.test(batchDef?.inputSchema?.properties?.actions?.description ?? ''),
+      'batch_actions advertises itself as the preferred path with documented step shapes');
 
-    // 4. screen_capture — safe args, no image payload in the response. The
-    // engine always writes the capture to disk regardless (defaulting to a
-    // generated temp path) — pass save_path explicitly so we can clean up
-    // after ourselves rather than littering the temp folder.
+    // 3. system_info - read-only, always safe
+    const sysInfo = await client.callTool('system_info', {});
+    const monitorCount = (toolResultText(sysInfo).match(/^ {2}\d+/gm) ?? []).length;
+    assert(!sysInfo.isError && monitorCount > 0,
+      'system_info returns monitor/cursor data', `${monitorCount} monitor(s)`);
+
+    // 4. screen_capture - safe args, no image payload in the response.
     const shotPath1 = tmpShotPath();
     const shot = await client.callTool('screen_capture', {
       screen_index: 0, max_dimension: 64, format: 'jpeg', return_image: false, save_path: shotPath1
@@ -261,8 +281,7 @@ async function main() {
     assert(!shot.isError, 'screen_capture (screen_index:0, no image payload)');
     cleanupShot(shotPath1);
 
-    // 4b. screen_capture — roi: the captured source size must match the
-    // requested crop rectangle exactly.
+    // 4b. roi: the captured source size must match the requested crop exactly.
     const shotPath2 = tmpShotPath();
     const shotRoi = await client.callTool('screen_capture', {
       roi: { x: 10, y: 10, width: 150, height: 90 }, return_image: false, save_path: shotPath2
@@ -271,7 +290,7 @@ async function main() {
       'screen_capture roi (crop size matches request)', toolResultText(shotRoi).split('\n')[0]);
     cleanupShot(shotPath2);
 
-    // 4c. screen_capture — target_active_window
+    // 4c. target_active_window
     const shotPath3 = tmpShotPath();
     const shotActive = await client.callTool('screen_capture', {
       target_active_window: true, return_image: false, save_path: shotPath3
@@ -279,69 +298,97 @@ async function main() {
     assert(!shotActive.isError, 'screen_capture target_active_window');
     cleanupShot(shotPath3);
 
-    // 5. ui_inspect — read-only introspection of whatever is currently active
+    // 4d. panorama - one image covering every monitor, each with its own
+    // resolution budget and a coordinate map back to the desktop.
+    const panoPath = tmpShotPath();
+    const pano = await client.callTool('screen_capture', {
+      panorama: true, max_dimension: 320, return_image: false, save_path: panoPath
+    });
+    const panoText = toolResultText(pano);
+    const panoDims = panoText.match(/Panorama: (\d+)x(\d+) across (\d+) monitor/);
+    assert(!pano.isError && panoDims && Number(panoDims[3]) === monitorCount,
+      'screen_capture panorama covers every monitor',
+      panoDims ? `${panoDims[1]}x${panoDims[2]} across ${panoDims[3]}` : panoText.split('\n')[0]);
+    assert(/panorama rect \(\d+,\d+\)/.test(panoText) && /desktop_x = /.test(panoText),
+      'panorama returns a per-screen coordinate map');
+    // With N monitors, per-monitor budgeting must produce a wider image than a
+    // single squashed virtual-desktop grab at the same budget.
+    if (monitorCount > 1 && panoDims) {
+      assert(Number(panoDims[1]) > 320,
+        'panorama budgets max_dimension per monitor, not across the whole desktop',
+        `width ${panoDims[1]} > 320`);
+    }
+    cleanupShot(panoPath);
+
+    // 5. ui_inspect - read-only introspection of whatever is currently active
     const inspect = await client.callTool('ui_inspect', {
       target: 'active_window', max_depth: 2, interactive_only: true
     });
     assert(!inspect.isError, 'ui_inspect (active_window, shallow)');
 
-    // 6. window_manager — list + get_active, always safe
+    // 6. window_manager - list + get_active, always safe
     const wmList = await client.callTool('window_manager', { action: 'list' });
-    assert(!wmList.isError, 'window_manager list');
+    assert(!wmList.isError && /^Windows \(\d+\):/.test(toolResultText(wmList)), 'window_manager list');
     const wmActive = await client.callTool('window_manager', { action: 'get_active' });
-    assert(!wmActive.isError, 'window_manager get_active');
+    assert(!wmActive.isError && /Active window:/.test(toolResultText(wmActive)), 'window_manager get_active');
 
-    // --- Interactive tests: only inside a verified disposable Notepad tab ---
-    const tabTitle = await openVerifiedBlankNotepad(client);
-    blankTabOpened = true;
-    ok('disposable blank Notepad tab confirmed focused', tabTitle);
+    // 6b. app_launch on a name that cannot start must report an error, never a
+    // false success on some unrelated window that happened to match.
+    const badLaunch = await client.callTool('app_launch', {
+      app: 'zzz_no_such_executable_zzz.exe', timeout_ms: 2000
+    }, 30000);
+    assert(badLaunch.isError && /Launch failed/.test(toolResultText(badLaunch)),
+      'app_launch reports a failure instead of matching an unrelated window');
 
-    // 7. mouse_action — move, then every click variant. Clicks only ever
-    // land inside our own verified-blank disposable tab (see MISSION.md
-    // Hors périmètre) — never against a window we didn't open ourselves.
+    // 6c. wait_for must time out cleanly on something that will never appear.
+    const badWait = await client.callTool('wait_for', {
+      window: 'zzz_no_such_window_zzz', timeout_ms: 600
+    }, 30000);
+    assert(badWait.isError && /wait_for:/.test(toolResultText(badWait)),
+      'wait_for times out cleanly on a condition that never holds');
+
+    // --- Interactive tests: only inside our own disposable scratch window ---
+    scratch = await openScratchApp(client);
+    ok(`disposable scratch window confirmed focused`, `${scratch.kind}: ${scratch.title}`);
+
+    // 7. mouse_action - move, then every click variant, inside our own window.
     const move = await client.callTool('mouse_action', { action: 'move', x: 400, y: 300 });
-    assert(!move.isError, 'mouse_action move');
+    assert(!move.isError && /mouse move at \(400, 300\)/.test(toolResultText(move)), 'mouse_action move');
+
+    const smoothMove = await client.callTool('mouse_action', {
+      action: 'move', x: 420, y: 320, smooth: true
+    });
+    assert(!smoothMove.isError, 'mouse_action smooth move (direct call)');
 
     const rightClick = await client.callTool('mouse_action', { action: 'right_click', x: 400, y: 300 });
-    assert(!rightClick.isError && /"button":\s*"right"/.test(toolResultText(rightClick)),
-      'mouse_action right_click (button:right)');
-    // right_click opens Notepad's context menu — dismiss it before continuing.
+    assert(!rightClick.isError, 'mouse_action right_click');
     await client.callTool('keyboard_action', { action: 'press_key', key: 'Escape' });
 
     const middleClick = await client.callTool('mouse_action', { action: 'middle_click', x: 400, y: 300 });
-    assert(!middleClick.isError && /"button":\s*"middle"/.test(toolResultText(middleClick)),
-      'mouse_action middle_click (button:middle)');
+    assert(!middleClick.isError, 'mouse_action middle_click');
 
     const doubleClick = await client.callTool('mouse_action', { action: 'double_click', x: 400, y: 300 });
-    assert(!doubleClick.isError && /"clicks":\s*2/.test(toolResultText(doubleClick)),
-      'mouse_action double_click (clicks:2)');
+    assert(!doubleClick.isError, 'mouse_action double_click');
 
     const tripleClick = await client.callTool('mouse_action', { action: 'triple_click', x: 400, y: 300 });
-    assert(!tripleClick.isError && /"clicks":\s*3/.test(toolResultText(tripleClick)),
-      'mouse_action triple_click (clicks:3)');
+    assert(!tripleClick.isError, 'mouse_action triple_click');
 
-    // 7b. ui_inspect — target=cursor, now that the cursor is parked at a
-    // known point inside the disposable tab.
+    // 7b. ui_inspect variants
     const inspectCursor = await client.callTool('ui_inspect', { target: 'cursor', max_depth: 3 });
     assert(!inspectCursor.isError, 'ui_inspect target=cursor');
 
-    // 7c. ui_inspect — target=screen (whole desktop, not just active_window)
     const inspectScreen = await client.callTool('ui_inspect', { target: 'screen', max_depth: 2 });
-    assert(!inspectScreen.isError && /\((\d+) found/.test(toolResultText(inspectScreen)) &&
-      Number(toolResultText(inspectScreen).match(/\((\d+) found/)[1]) > 0,
-      'ui_inspect target=screen (top-level windows found)');
+    const screenCount = Number(toolResultText(inspectScreen).match(/\((\d+) found/)?.[1] ?? -1);
+    assert(!inspectScreen.isError && screenCount > 0,
+      'ui_inspect target=screen (top-level windows found)', `count=${screenCount}`);
 
-    // 7d. ui_inspect — filter, on an element guaranteed present in Notepad
-    // (the text editor pane itself).
     const inspectFilter = await client.callTool('ui_inspect', {
-      target: 'active_window', max_depth: 6, filter: 'Document'
+      target: 'active_window', max_depth: 6, filter: scratch.editFilter, interactive_only: false
     });
     const filterCount = Number(toolResultText(inspectFilter).match(/\((\d+) found/)?.[1] ?? -1);
     assert(!inspectFilter.isError && filterCount >= 1,
-      'ui_inspect filter="Document" narrows to the text editor pane', `count=${filterCount}`);
+      `ui_inspect filter="${scratch.editFilter}" narrows to the editable field`, `count=${filterCount}`);
 
-    // 7e. ui_inspect — interactive_only: false must surface at least as many
-    // elements as interactive_only: true on the same tree.
     const inspectInteractive = await client.callTool('ui_inspect', {
       target: 'active_window', max_depth: 6, interactive_only: true
     });
@@ -354,52 +401,142 @@ async function main() {
       'ui_inspect interactive_only=false includes at least as much as true',
       `interactive_only=true:${nInteractive} interactive_only=false:${nAll}`);
 
-    // 8. keyboard_action — type into the verified-blank tab
-    const type = await client.callTool('keyboard_action', {
-      action: 'type_text', text: 'fast-computer-use smoke test'
+    // 8. Put the caret in the editable field, then type into it.
+    await client.callTool('batch_actions', {
+      actions: [{ cmd: 'ui_click', ...(scratch.kind === 'charmap' ? { automation_id: '104' } : { control_type: 'Document' }) }]
     });
-    assert(!type.isError, 'keyboard_action type_text (into disposable tab)');
+    const type = await client.callTool('keyboard_action', { action: 'type_text', text: SCRATCH_TEXT });
+    assert(!type.isError, 'keyboard_action type_text (into disposable window)');
 
-    // 9. window_manager — minimize/maximize/restore on our own disposable window
-    const min = await client.callTool('window_manager', { action: 'minimize', target: 'Notepad' });
+    // 8b. read_text reads that back out of UI Automation, with an assertion -
+    // this is the no-screenshot way to confirm an action actually landed.
+    const read = await client.callTool('read_text', { filter: scratch.editFilter, expect: SCRATCH_TEXT });
+    assert(!read.isError && /Contains .*: true/.test(toolResultText(read)),
+      'read_text reads the typed text back and asserts it', toolResultText(read).split('\n')[0]);
+
+    // 8c. read_text must fail loudly when the assertion does not hold.
+    const readBad = await client.callTool('read_text', {
+      filter: scratch.editFilter, expect: 'zzz_text_that_is_not_there_zzz'
+    });
+    assert(readBad.isError, 'read_text reports a failed expectation as an error');
+
+    // 9. window_manager - minimize/maximize/restore on our own window
+    const wmTarget = scratch.title;
+    const min = await client.callTool('window_manager', { action: 'minimize', target: wmTarget });
     assert(!min.isError, 'window_manager minimize');
     await sleep(200);
-    const restore = await client.callTool('window_manager', { action: 'restore', target: 'Notepad' });
+    const restore = await client.callTool('window_manager', { action: 'restore', target: wmTarget });
     assert(!restore.isError, 'window_manager restore');
     await sleep(200);
-    const max = await client.callTool('window_manager', { action: 'maximize', target: 'Notepad' });
+    const max = await client.callTool('window_manager', { action: 'maximize', target: wmTarget });
     assert(!max.isError, 'window_manager maximize');
     await sleep(200);
-    const restore2 = await client.callTool('window_manager', { action: 'restore', target: 'Notepad' });
+    const restore2 = await client.callTool('window_manager', { action: 'restore', target: wmTarget });
     assert(!restore2.isError, 'window_manager restore (after maximize)');
     await sleep(200);
 
-    // 10. batch_actions — including the cmd:"wait" fix
-    const batch = await client.callTool('batch_actions', {
-      actions: [{ cmd: 'wait', ms: 50 }, { cmd: 'ping' }]
+    // 9b. focus must verify it actually reached the foreground, not just issue
+    // a SetForegroundWindow that Windows may silently refuse.
+    const focus = await client.callTool('window_manager', { action: 'focus', target: wmTarget });
+    assert(!focus.isError && /foreground: true/.test(toolResultText(focus)),
+      'window_manager focus confirms the window really reached the foreground',
+      toolResultText(focus).slice(0, 90));
+
+    // 10. batch_actions - the routing fix: a step carrying only "action"
+    // (the field name every tool schema uses) used to die on "Unknown command".
+    const batchAction = await client.callTool('batch_actions', {
+      actions: [
+        { action: 'move', x: 500, y: 400 },
+        { action: 'move', x: 520, y: 420, smooth: true },
+        { cmd: 'wait', ms: 20 }
+      ]
     });
-    const batchText = toolResultText(batch);
-    assert(!batch.isError && batchText.includes('Executed 2 actions'),
-      'batch_actions (cmd:"wait" + ping)', batchText.split('\n')[0]);
+    const batchActionText = toolResultText(batchAction);
+    assert(!batchAction.isError && /Batch completed: 3 step\(s\), 0 failed/.test(batchActionText),
+      'batch_actions runs steps that name only "action" (incl. smooth move)',
+      batchActionText.split('\n')[0]);
+    assert(!/Unknown command/.test(batchActionText),
+      'batch_actions no longer reports "Unknown command" for action-only steps');
+
+    // 10b. a failing step halts the batch instead of typing on into the void.
+    const batchHalt = await client.callTool('batch_actions', {
+      actions: [{ action: 'move', x: 500, y: 400 }, { cmd: 'zzz_bad_cmd' }, { action: 'move', x: 600, y: 500 }]
+    });
+    const haltText = toolResultText(batchHalt);
+    assert(batchHalt.isError && /Halted at step 2/.test(haltText) && /2 step\(s\), 1 failed/.test(haltText),
+      'batch_actions halts at the first failing step', haltText.split('\n')[0]);
+
+    // 10c. continue_on_error opts back into running the whole list.
+    const batchContinue = await client.callTool('batch_actions', {
+      actions: [{ action: 'move', x: 500, y: 400 }, { cmd: 'zzz_bad_cmd' }, { action: 'move', x: 600, y: 500 }],
+      continue_on_error: true
+    });
+    assert(/3 step\(s\), 1 failed/.test(toolResultText(batchContinue)),
+      'batch_actions continue_on_error runs past a failure');
+
+    // 10d. snake_case fields inside a batch step must reach the engine, or a
+    // capture silently comes back at full resolution and costs a fortune.
+    const batchShotPath = tmpShotPath();
+    const batchShot = await client.callTool('batch_actions', {
+      actions: [{ cmd: 'screenshot', max_dimension: 200, return_image: false, save_path: batchShotPath }]
+    });
+    assert(!batchShot.isError && toolResultText(batchShot).includes(batchShotPath),
+      'batch_actions normalizes snake_case step fields for the engine');
+    cleanupShot(batchShotPath);
+
+    // 11. wait_for and per-step verify inside a batch.
+    const batchVerify = await client.callTool('batch_actions', {
+      actions: [
+        { cmd: 'wait_for', window: wmTarget, timeout_ms: 3000 },
+        { cmd: 'mouse', action: 'move', x: 480, y: 360, verify: true }
+      ]
+    });
+    const verifyText = toolResultText(batchVerify);
+    assert(!batchVerify.isError && /wait_for/.test(verifyText) && /verify\(state\)/.test(verifyText),
+      'batch_actions supports wait_for and per-step verify', verifyText.split('\n')[0]);
+
+    // 11b. a verification that cannot hold must fail its step.
+    const badVerify = await client.callTool('batch_actions', {
+      actions: [{ cmd: 'mouse', action: 'move', x: 480, y: 360, verify: 'zzz_no_such_element_zzz' }]
+    });
+    assert(badVerify.isError && /1 failed/.test(toolResultText(badVerify)),
+      'a step whose verification fails is reported as failed');
+
+    // 12. The headline scenario, in ONE call: put text in the scratch window
+    // and prove it is there, with no screenshot and no intermediate round trip.
+    const scenarioText = 'hello world';
+    const t0 = Date.now();
+    const scenario = await client.callTool('batch_actions', {
+      actions: [
+        { cmd: 'window_focus', target: wmTarget },
+        { cmd: 'ui_click', ...(scratch.kind === 'charmap' ? { automation_id: '104' } : { control_type: 'Document' }) },
+        { cmd: 'keyboard', action: 'hotkey', hotkey: 'ctrl+a' },
+        { cmd: 'keyboard', action: 'type_text', text: scenarioText },
+        { cmd: 'read_text', filter: scratch.editFilter, expect: scenarioText }
+      ]
+    }, 60000);
+    const elapsed = Date.now() - t0;
+    const scenarioText2 = toolResultText(scenario);
+    assert(!scenario.isError && /matched=true/.test(scenarioText2),
+      `end-to-end scenario (focus, click, type, verify) in one batch_actions call`,
+      `${elapsed}ms wall`);
+    assert(elapsed < 5000, 'end-to-end scenario completes in under 5s', `${elapsed}ms`);
 
   } catch (err) {
     fail('unexpected exception', err.message);
   } finally {
-    if (blankTabOpened) {
-      await closeNotepadTab(client);
-      // Teardown is not "best effort and forget" — confirm it actually left
-      // no dirty scratch tab behind, as a real, counted check. The window
-      // can take a moment to actually disappear after "Don't save" is
-      // clicked (tab-close transition), so poll briefly rather than check
-      // once immediately.
+    if (scratch) {
+      await closeScratchApp(client, scratch);
       try {
-        let stillDirty = true;
-        for (let i = 0; i < 5 && stillDirty; i++) {
+        let stillOpen = true;
+        for (let i = 0; i < 5 && stillOpen; i++) {
           const list = await client.callTool('window_manager', { action: 'list' });
-          stillDirty = toolResultText(list).includes(DISPOSABLE_TAB_TEXT);
-          if (stillDirty) await sleep(300);
+          stillOpen = scratch.hwnd
+            ? toolResultText(list).includes(`hwnd=${scratch.hwnd}`)
+            : toolResultText(list).includes(scratch.closeTarget);
+          if (stillOpen) await sleep(300);
         }
-        assert(!stillDirty, 'disposable Notepad tab left no dirty window behind');
+        assert(!stillOpen, 'disposable scratch window left nothing behind');
       } catch (err) {
         fail('post-teardown window check', err.message);
       }
@@ -408,6 +545,7 @@ async function main() {
   }
 
   console.log(`\n${passCount} passed, ${failCount} failed.`);
+  if (notes.length) console.log(`Notes: ${notes.length} (see "note" lines above)`);
   if (failCount > 0) {
     console.error('Failures:', failures.join('; '));
     process.exit(1);

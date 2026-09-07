@@ -44,6 +44,27 @@ namespace FastComputerUse {
         static extern bool IsWindowVisible(IntPtr hWnd);
 
         [DllImport("user32.dll")]
+        static extern bool IsWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+
+        [DllImport("user32.dll")]
+        static extern bool BringWindowToTop(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        static extern void SwitchToThisWindow(IntPtr hWnd, bool fAltTab);
+
+        [DllImport("kernel32.dll")]
+        static extern uint GetCurrentThreadId();
+
+        [DllImport("winmm.dll", EntryPoint = "timeBeginPeriod")]
+        static extern uint TimeBeginPeriod(uint uMilliseconds);
+
+        [DllImport("winmm.dll", EntryPoint = "timeEndPeriod")]
+        static extern uint TimeEndPeriod(uint uMilliseconds);
+
+        [DllImport("user32.dll")]
         static extern bool IsIconic(IntPtr hWnd);
 
         [DllImport("user32.dll")]
@@ -141,7 +162,21 @@ namespace FastComputerUse {
                 SetProcessDPIAware();
             } catch {}
 
+            // Windows' default timer granularity is ~15.6 ms, so every Sleep(5) in an
+            // input sequence really costs 15.6 ms. Typing 11 characters would burn
+            // 170 ms of pure waiting. Asking for 1 ms resolution removes that tax.
+            try {
+                TimeBeginPeriod(1);
+                AppDomain.CurrentDomain.ProcessExit += delegate { try { TimeEndPeriod(1); } catch {} };
+            } catch {}
+
             serializer.MaxJsonLength = int.MaxValue;
+
+            // Without this the daemon writes its JSON in the console codepage, so any
+            // non-ASCII window title comes back mangled and can no longer be used as a
+            // lookup key. Every non-English Windows hits this.
+            try { Console.OutputEncoding = new UTF8Encoding(false); } catch {}
+            try { Console.InputEncoding = new UTF8Encoding(false); } catch {}
 
             if (args.Length > 0 && args[0] == "--daemon") {
                 RunDaemon();
@@ -221,7 +256,14 @@ namespace FastComputerUse {
 
                     case "screenshot":
                     case "screen_capture":
+                        if (ToBool(req, "panorama", false) || ToStr(req, "target", "").ToLower() == "panorama") {
+                            return CapturePanorama(req);
+                        }
                         return CaptureScreenshot(req);
+
+                    case "panorama":
+                    case "screen_panorama":
+                        return CapturePanorama(req);
 
                     case "mouse":
                     case "mouse_action":
@@ -285,6 +327,27 @@ namespace FastComputerUse {
                     case "batch":
                     case "batch_actions":
                         return ExecuteBatch(req);
+
+                    case "wait_for":
+                    case "wait_until":
+                        return WaitForCondition(req);
+
+                    case "launch":
+                    case "start_app":
+                    case "app_launch":
+                        return LaunchApp(req);
+
+                    case "read_text":
+                    case "get_text":
+                        return ReadText(req);
+
+                    case "wait":
+                    case "sleep":
+                        PreciseSleep(ToInt(req, "ms", 100));
+                        res["status"] = "ok";
+                        res["action"] = "wait";
+                        res["ms"] = ToInt(req, "ms", 100);
+                        break;
 
                     case "window_list":
                     case "windows":
@@ -479,6 +542,144 @@ namespace FastComputerUse {
             return res;
         }
 
+        // Unlike a raw virtual-desktop grab, the downscale budget applies PER MONITOR,
+        // so nothing is squashed into an illegible strip. Each panel carries the map
+        // back to real desktop coordinates.
+        static Dictionary<string, object> CapturePanorama(Dictionary<string, object> req) {
+            var res = new Dictionary<string, object>();
+            res["action"] = "panorama";
+
+            int maxDim = ToInt(req, "maxDimension", ToInt(req, "max_dimension", 1280));
+            string format = ToStr(req, "format", "jpeg").ToLower();
+            int quality = ToInt(req, "quality", 80);
+            string savePath = ToStr(req, "savePath", ToStr(req, "save_path", ""));
+            bool returnBase64 = !req.ContainsKey("returnBase64") || ToBool(req, "returnBase64", true);
+            bool labels = ToBool(req, "labels", true);
+            int gap = ToInt(req, "gap", 8);
+
+            // Left-to-right, top-to-bottom: the order a person sees their desks in.
+            var screens = new List<Screen>(Screen.AllScreens);
+            screens.Sort(delegate(Screen a, Screen b) {
+                if (a.Bounds.X != b.Bounds.X) return a.Bounds.X.CompareTo(b.Bounds.X);
+                return a.Bounds.Y.CompareTo(b.Bounds.Y);
+            });
+
+            var only = new List<int>();
+            if (req.ContainsKey("screens") && req["screens"] is IEnumerable && !(req["screens"] is string)) {
+                foreach (var v in (IEnumerable)req["screens"]) {
+                    try { only.Add(Convert.ToInt32(v)); } catch {}
+                }
+            }
+
+            var panels = new List<Dictionary<string, object>>();
+            int totalW = 0, maxH = 0;
+
+            for (int i = 0; i < screens.Count; i++) {
+                Rectangle b = screens[i].Bounds;
+                int originalIndex = Array.IndexOf(Screen.AllScreens, screens[i]);
+                if (only.Count > 0 && !only.Contains(originalIndex)) continue;
+
+                double scale = 1.0;
+                if (maxDim > 0 && (b.Width > maxDim || b.Height > maxDim)) {
+                    scale = Math.Min((double)maxDim / b.Width, (double)maxDim / b.Height);
+                }
+                int dw = Math.Max(1, (int)(b.Width * scale));
+                int dh = Math.Max(1, (int)(b.Height * scale));
+
+                var panel = new Dictionary<string, object>();
+                panel["index"] = originalIndex;
+                panel["primary"] = screens[i].Primary;
+                panel["bounds"] = new Dictionary<string, object> {
+                    { "x", b.X }, { "y", b.Y }, { "width", b.Width }, { "height", b.Height }
+                };
+                panel["scale"] = Math.Round(scale, 4);
+                panel["_w"] = dw;
+                panel["_h"] = dh;
+                panel["_src"] = b;
+                panels.Add(panel);
+
+                totalW += dw + (panels.Count > 1 ? gap : 0);
+                if (dh > maxH) maxH = dh;
+            }
+
+            if (panels.Count == 0) {
+                res["status"] = "error";
+                res["message"] = "no monitor matched the requested screens";
+                return res;
+            }
+
+            using (Bitmap canvas = new Bitmap(Math.Max(1, totalW), Math.Max(1, maxH), PixelFormat.Format24bppRgb)) {
+                using (Graphics g = Graphics.FromImage(canvas)) {
+                    g.Clear(Color.FromArgb(24, 24, 24));
+                    g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+
+                    int cursorX = 0;
+                    foreach (var panel in panels) {
+                        Rectangle src = (Rectangle)panel["_src"];
+                        int dw = (int)panel["_w"];
+                        int dh = (int)panel["_h"];
+                        int dy = (maxH - dh) / 2;
+
+                        using (Bitmap raw = new Bitmap(src.Width, src.Height, PixelFormat.Format32bppArgb)) {
+                            using (Graphics rg = Graphics.FromImage(raw)) {
+                                rg.CopyFromScreen(src.Location, Point.Empty, src.Size, CopyPixelOperation.SourceCopy);
+                            }
+                            g.DrawImage(raw, cursorX, dy, dw, dh);
+                        }
+
+                        if (labels) {
+                            string tag = "screen " + panel["index"] + ((bool)panel["primary"] ? " (primary)" : "");
+                            using (Font f = new Font("Segoe UI", 11, FontStyle.Bold))
+                            using (SolidBrush bg = new SolidBrush(Color.FromArgb(200, 0, 0, 0)))
+                            using (SolidBrush fgb = new SolidBrush(Color.White)) {
+                                SizeF sz = g.MeasureString(tag, f);
+                                g.FillRectangle(bg, cursorX + 4, dy + 4, sz.Width + 8, sz.Height + 4);
+                                g.DrawString(tag, f, fgb, cursorX + 8, dy + 6);
+                            }
+                        }
+
+                        panel["dest"] = new Dictionary<string, object> {
+                            { "x", cursorX }, { "y", dy }, { "width", dw }, { "height", dh }
+                        };
+                        panel.Remove("_w");
+                        panel.Remove("_h");
+                        panel.Remove("_src");
+
+                        cursorX += dw + gap;
+                    }
+                }
+
+                if (string.IsNullOrEmpty(savePath)) {
+                    string ext = format == "png" ? ".png" : ".jpg";
+                    savePath = Path.Combine(Path.GetTempPath(), "fast_cu_pano_" + Guid.NewGuid().ToString("N").Substring(0, 8) + ext);
+                }
+
+                ImageCodecInfo encoder = GetEncoder(format == "png" ? ImageFormat.Png : ImageFormat.Jpeg);
+                EncoderParameters encoderParams = new EncoderParameters(1);
+                encoderParams.Param[0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, (long)quality);
+                canvas.Save(savePath, encoder, encoderParams);
+
+                res["status"] = "ok";
+                res["path"] = savePath;
+                res["width"] = canvas.Width;
+                res["height"] = canvas.Height;
+                res["screens"] = panels;
+                res["virtualScreen"] = new Dictionary<string, object> {
+                    { "x", SystemInformation.VirtualScreen.X }, { "y", SystemInformation.VirtualScreen.Y },
+                    { "width", SystemInformation.VirtualScreen.Width }, { "height", SystemInformation.VirtualScreen.Height }
+                };
+                res["mapping"] = "desktop_x = screens[i].bounds.x + (pano_x - screens[i].dest.x) / screens[i].scale; same for y";
+
+                if (returnBase64) {
+                    byte[] bytes = File.ReadAllBytes(savePath);
+                    res["base64"] = Convert.ToBase64String(bytes);
+                    res["mimeType"] = format == "png" ? "image/png" : "image/jpeg";
+                }
+            }
+
+            return res;
+        }
+
         static ImageCodecInfo GetEncoder(ImageFormat format) {
             ImageCodecInfo[] codecs = ImageCodecInfo.GetImageDecoders();
             foreach (ImageCodecInfo codec in codecs) {
@@ -488,20 +689,26 @@ namespace FastComputerUse {
         }
 
         static Dictionary<string, object> MouseMove(Dictionary<string, object> req) {
-            int x = Convert.ToInt32(req["x"]);
-            int y = Convert.ToInt32(req["y"]);
-            bool smooth = req.ContainsKey("smooth") && Convert.ToBoolean(req["smooth"]);
+            int x = ToInt(req, "x", 0);
+            int y = ToInt(req, "y", 0);
+            bool smooth = ToBool(req, "smooth", false);
 
             if (smooth) {
                 POINT start;
                 GetCursorPos(out start);
-                int steps = 10;
+                // Step count follows the distance travelled, so a short hop is not
+                // charged the same fixed cost as a cross-screen sweep.
+                double dist = Math.Sqrt(Math.Pow(x - start.X, 2) + Math.Pow(y - start.Y, 2));
+                int steps = ToInt(req, "steps", Math.Max(4, Math.Min(24, (int)(dist / 40))));
+                int totalMs = ToInt(req, "duration_ms", ToInt(req, "durationMs", 40));
+                int stepDelay = Math.Max(0, totalMs / Math.Max(1, steps));
                 for (int i = 1; i <= steps; i++) {
                     int cx = start.X + (x - start.X) * i / steps;
                     int cy = start.Y + (y - start.Y) * i / steps;
                     SetCursorPos(cx, cy);
-                    Thread.Sleep(5);
+                    if (stepDelay > 0) PreciseSleep(stepDelay);
                 }
+                SetCursorPos(x, y);
             } else {
                 SetCursorPos(x, y);
             }
@@ -518,7 +725,8 @@ namespace FastComputerUse {
                 int x = Convert.ToInt32(req["x"]);
                 int y = Convert.ToInt32(req["y"]);
                 SetCursorPos(x, y);
-                Thread.Sleep(5);
+                int settle = ToInt(req, "settle_ms", 3);
+                if (settle > 0) PreciseSleep(settle);
             }
 
             string action = req.ContainsKey("action") && req["action"] != null ? req["action"].ToString().ToLower() : "click";
@@ -547,9 +755,9 @@ namespace FastComputerUse {
 
             for (int i = 0; i < clicks; i++) {
                 mouse_event(downFlag, 0, 0, 0, UIntPtr.Zero);
-                Thread.Sleep(10);
+                PreciseSleep(10);
                 mouse_event(upFlag, 0, 0, 0, UIntPtr.Zero);
-                if (i < clicks - 1) Thread.Sleep(50);
+                if (i < clicks - 1) PreciseSleep(50);
             }
 
             POINT pt;
@@ -591,20 +799,20 @@ namespace FastComputerUse {
             int duration = req.ContainsKey("durationMs") ? Convert.ToInt32(req["durationMs"]) : 100;
 
             SetCursorPos(x1, y1);
-            Thread.Sleep(20);
+            PreciseSleep(20);
             mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
-            Thread.Sleep(20);
+            PreciseSleep(20);
 
             int steps = Math.Max(5, duration / 10);
             for (int i = 1; i <= steps; i++) {
                 int cx = x1 + (x2 - x1) * i / steps;
                 int cy = y1 + (y2 - y1) * i / steps;
                 SetCursorPos(cx, cy);
-                Thread.Sleep(duration / steps);
+                PreciseSleep(duration / steps);
             }
 
             SetCursorPos(x2, y2);
-            Thread.Sleep(20);
+            PreciseSleep(20);
             mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, UIntPtr.Zero);
 
             var res = new Dictionary<string, object>();
@@ -624,7 +832,7 @@ namespace FastComputerUse {
 
             if (req.ContainsKey("x") && req.ContainsKey("y") && req["x"] != null && req["y"] != null) {
                 SetCursorPos(Convert.ToInt32(req["x"]), Convert.ToInt32(req["y"]));
-                Thread.Sleep(5);
+                PreciseSleep(5);
             }
 
             uint flag = horizontal ? MOUSEEVENTF_HWHEEL : MOUSEEVENTF_WHEEL;
@@ -651,7 +859,7 @@ namespace FastComputerUse {
                 t.Start();
                 t.Join();
 
-                Thread.Sleep(10);
+                PreciseSleep(10);
                 SendHotkeySequence(new List<string> { "ctrl", "v" });
             } else {
                 int delayMs = req.ContainsKey("delayMs") ? Convert.ToInt32(req["delayMs"]) : 2;
@@ -666,7 +874,7 @@ namespace FastComputerUse {
                     } else {
                         SendUnicodeChar(c);
                     }
-                    if (delayMs > 0) Thread.Sleep(delayMs);
+                    if (delayMs > 0) PreciseSleep(delayMs);
                 }
             }
 
@@ -757,14 +965,14 @@ namespace FastComputerUse {
 
             foreach (ushort vk in vks) {
                 SendKey(vk, true);
-                Thread.Sleep(5);
+                PreciseSleep(5);
             }
 
-            Thread.Sleep(10);
+            PreciseSleep(10);
 
             for (int i = vks.Count - 1; i >= 0; i--) {
                 SendKey(vks[i], false);
-                Thread.Sleep(5);
+                PreciseSleep(5);
             }
         }
 
@@ -803,7 +1011,7 @@ namespace FastComputerUse {
                 SendKey(vk, false);
             } else {
                 SendKey(vk, true);
-                Thread.Sleep(10);
+                PreciseSleep(10);
                 SendKey(vk, false);
             }
 
@@ -814,11 +1022,93 @@ namespace FastComputerUse {
             return res;
         }
 
+        // Maps a bare "action" value (mouse/keyboard/window/screen verbs used by the
+        // MCP tool schemas) onto the engine command that handles it.
+        static string CommandForAction(string action) {
+            switch (action) {
+                case "click": case "double_click": case "triple_click":
+                case "right_click": case "middle_click": case "move":
+                case "mouse_down": case "mouse_up": case "drag": case "scroll":
+                    return "mouse";
+
+                case "type_text": case "type": case "paste_text": case "paste":
+                case "hotkey": case "press_key": case "key": case "key_down": case "key_up":
+                    return "keyboard";
+
+                case "list": case "windows": case "window_list":
+                    return "window_list";
+                case "get_active": case "active_window":
+                    return "info";
+                case "focus": case "activate":
+                    return "window_focus";
+                case "minimize": case "maximize": case "restore":
+                    return "window_state";
+                case "close":
+                    return "window_close";
+                case "set_pos": case "move_window": case "resize":
+                    return "window_pos";
+
+                case "screenshot": case "capture": case "screen_capture":
+                    return "screenshot";
+                case "inspect": case "ui_inspect":
+                    return "ui_inspect";
+                case "launch": case "start": case "run": case "open":
+                    return "launch";
+                case "info": case "system_info": case "screen_info":
+                    return "info";
+                default:
+                    return action;
+            }
+        }
+
+        // Short waits spin on the stopwatch instead of yielding to the scheduler: below
+        // one timer tick, Sleep overshoots by an order of magnitude.
+        static void PreciseSleep(int ms) {
+            if (ms <= 0) return;
+            if (ms >= 16) { Thread.Sleep(ms); return; }
+            var sw = Stopwatch.StartNew();
+            long ticks = (long)(ms * (Stopwatch.Frequency / 1000.0));
+            while (sw.ElapsedTicks < ticks) Thread.SpinWait(40);
+        }
+
+        static string ToStr(Dictionary<string, object> req, string key, string def) {
+            if (req.ContainsKey(key) && req[key] != null) {
+                string v = req[key].ToString();
+                if (!string.IsNullOrEmpty(v)) return v;
+            }
+            return def;
+        }
+
+        static int ToInt(Dictionary<string, object> req, string key, int def) {
+            if (req.ContainsKey(key) && req[key] != null) {
+                try { return Convert.ToInt32(req[key]); } catch {}
+            }
+            return def;
+        }
+
+        static bool ToBool(Dictionary<string, object> req, string key, bool def) {
+            if (req.ContainsKey(key) && req[key] != null) {
+                object v = req[key];
+                if (v is bool) return (bool)v;
+                string s = v.ToString().Trim();
+                if (s.Equals("true", StringComparison.OrdinalIgnoreCase) || s == "1") return true;
+                if (s.Equals("false", StringComparison.OrdinalIgnoreCase) || s == "0" || s.Length == 0) return false;
+                try { return Convert.ToBoolean(v); } catch {}
+            }
+            return def;
+        }
+
         static Dictionary<string, object> ExecuteBatch(Dictionary<string, object> req) {
             var results = new List<Dictionary<string, object>>();
+            int failed = 0;
+            int stoppedAt = -1;
+            // A pipeline that keeps typing after a focus or click failed lands input in
+            // the wrong window, so a failed step halts the batch by default.
+            bool continueOnError = ToBool(req, "continue_on_error", ToBool(req, "continueOnError", false));
 
             if (req.ContainsKey("actions") && req["actions"] is IEnumerable) {
                 IEnumerable list = req["actions"] as IEnumerable;
+                int index = 0;
                 foreach (var item in list) {
                     Dictionary<string, object> act = null;
                     if (item is Dictionary<string, object>) {
@@ -832,32 +1122,620 @@ namespace FastComputerUse {
                     }
 
                     if (act == null) continue;
+                    index++;
 
-                    string type = act.ContainsKey("type") && act["type"] != null ? act["type"].ToString().ToLower() : "";
-                    // Batch items may name the action via "cmd" instead of "type" — fall back to it
-                    // so cmd:"wait" is recognized the same way type:"wait" already is.
-                    if (string.IsNullOrEmpty(type) && act.ContainsKey("cmd") && act["cmd"] != null) {
-                        type = act["cmd"].ToString().ToLower();
-                    }
-                    if (!act.ContainsKey("cmd")) act["cmd"] = type;
+                    string type = ToStr(act, "cmd", "").ToLower();
+                    if (string.IsNullOrEmpty(type)) type = ToStr(act, "type", "").ToLower();
+                    // A batch item may carry only "action" - the field name every MCP tool
+                    // schema uses. Infer the engine command from it so the step runs instead
+                    // of falling through to "Unknown command".
+                    if (string.IsNullOrEmpty(type)) type = CommandForAction(ToStr(act, "action", "").ToLower());
+                    act["cmd"] = type;
 
+                    Stopwatch stepSw = Stopwatch.StartNew();
+                    Dictionary<string, object> actRes;
                     if (type == "wait" || type == "sleep" || type == "delay") {
-                        int ms = act.ContainsKey("ms") ? Convert.ToInt32(act["ms"]) : 100;
-                        Thread.Sleep(ms);
-                        var waitRes = new Dictionary<string, object> { { "status", "ok" }, { "action", "wait" }, { "ms", ms } };
-                        results.Add(waitRes);
+                        int ms = ToInt(act, "ms", ToInt(act, "duration_ms", 100));
+                        PreciseSleep(ms);
+                        actRes = new Dictionary<string, object> { { "status", "ok" }, { "action", "wait" }, { "ms", ms } };
+                    } else if (type == "wait_for" || type == "waitfor" || type == "wait_until") {
+                        actRes = WaitForCondition(act);
                     } else {
-                        var actRes = DispatchCommand(act);
-                        results.Add(actRes);
+                        actRes = DispatchCommand(act);
+                    }
+
+                    if (actRes == null) {
+                        actRes = new Dictionary<string, object> { { "status", "error" }, { "message", "no response from step" } };
+                    }
+                    actRes["step"] = index;
+                    if (!actRes.ContainsKey("action") && !string.IsNullOrEmpty(type)) actRes["action"] = type;
+
+                    bool stepOk = ToStr(actRes, "status", "") == "ok";
+
+                    // Per-step verification: confirm the step actually landed instead of
+                    // trusting it was merely issued without error. Text-only by design, so
+                    // confirming a step never costs an image payload.
+                    if (stepOk && act.ContainsKey("verify") && act["verify"] != null) {
+                        var vres = VerifyStep(act["verify"]);
+                        actRes["verify"] = vres;
+                        if (ToStr(vres, "status", "") != "ok") {
+                            stepOk = false;
+                            actRes["status"] = "error";
+                            actRes["message"] = ToStr(vres, "message", "verification failed");
+                        }
+                    }
+
+                    stepSw.Stop();
+                    actRes["elapsedMs"] = stepSw.ElapsedMilliseconds;
+                    results.Add(actRes);
+
+                    if (!stepOk) {
+                        failed++;
+                        if (!continueOnError) { stoppedAt = index; break; }
                     }
                 }
             }
 
             var res = new Dictionary<string, object>();
-            res["status"] = "ok";
+            res["status"] = failed > 0 ? "partial" : "ok";
             res["count"] = results.Count;
+            res["failed"] = failed;
+            if (stoppedAt > 0) {
+                res["stoppedAtStep"] = stoppedAt;
+                res["message"] = "batch halted at step " + stoppedAt + " (pass continue_on_error:true to run past failures)";
+            }
             res["results"] = results;
             return res;
+        }
+
+        // Confirms a step landed. Accepts a bare UIA filter string, true (report the
+        // foreground window), or an object { mode, filter, window, timeout_ms, present }.
+        static Dictionary<string, object> VerifyStep(object spec) {
+            var req = new Dictionary<string, object>();
+            if (spec is IDictionary) {
+                var idict = spec as IDictionary;
+                foreach (var k in idict.Keys) req[k.ToString()] = idict[k];
+            } else if (spec is bool) {
+                if (!((bool)spec)) return new Dictionary<string, object> { { "status", "ok" }, { "mode", "skipped" } };
+                req["mode"] = "state";
+            } else {
+                string str = spec.ToString().Trim();
+                if (str.Length == 0) return new Dictionary<string, object> { { "status", "ok" }, { "mode", "skipped" } };
+                req["filter"] = str;
+            }
+
+            string mode = ToStr(req, "mode", req.ContainsKey("window") ? "window" : (req.ContainsKey("filter") ? "element" : "state"));
+
+            if (mode == "state") {
+                IntPtr fg = GetForegroundWindow();
+                StringBuilder sb = new StringBuilder(512);
+                GetWindowText(fg, sb, 512);
+                return new Dictionary<string, object> {
+                    { "status", "ok" }, { "mode", "state" },
+                    { "foreground", sb.ToString() }, { "hwnd", fg.ToInt64() }
+                };
+            }
+
+            // Text verification reads the value back out of the control, which is the
+            // only reliable way to confirm a keystroke or a paste actually landed.
+            if (mode == "text" || req.ContainsKey("expect")) {
+                int textTimeout = ToInt(req, "timeout_ms", ToInt(req, "timeoutMs", 1500));
+                Stopwatch tsw = Stopwatch.StartNew();
+                Dictionary<string, object> last;
+                while (true) {
+                    last = ReadText(req);
+                    if (ToStr(last, "status", "") == "ok") { last["mode"] = "text"; return last; }
+                    if (tsw.ElapsedMilliseconds >= textTimeout) break;
+                    PreciseSleep(60);
+                }
+                tsw.Stop();
+                last["mode"] = "text";
+                last["waitedMs"] = tsw.ElapsedMilliseconds;
+                return last;
+            }
+
+            // Element and window verification reuse the wait_for polling loop, so a check
+            // tolerates the few hundred ms an app needs to repaint.
+            if (!req.ContainsKey("timeout_ms") && !req.ContainsKey("timeoutMs")) req["timeout_ms"] = 1500;
+            var waited = WaitForCondition(req);
+            waited["mode"] = mode;
+            return waited;
+        }
+
+        // Polls until a UIA element (filter) or a window (window) is present or absent.
+        // This replaces the fire-action / screenshot / ask-the-model-to-look round trip.
+        static Dictionary<string, object> WaitForCondition(Dictionary<string, object> req) {
+            string filter = ToStr(req, "filter", ToStr(req, "text", ""));
+            string window = ToStr(req, "window", "");
+            bool present = ToBool(req, "present", true);
+            bool needForeground = ToBool(req, "foreground", false);
+            int timeoutMs = ToInt(req, "timeout_ms", ToInt(req, "timeoutMs", 5000));
+            int pollMs = Math.Max(20, ToInt(req, "poll_ms", ToInt(req, "pollMs", 80)));
+            bool byWindow = !string.IsNullOrEmpty(window) && string.IsNullOrEmpty(filter);
+
+            var res = new Dictionary<string, object>();
+            res["action"] = "wait_for";
+            res["present"] = present;
+            if (byWindow) res["window"] = window; else res["filter"] = filter;
+
+            if (!byWindow && string.IsNullOrEmpty(filter)) {
+                res["status"] = "error";
+                res["message"] = "wait_for needs a filter (UI element) or a window (title/process)";
+                return res;
+            }
+
+            Stopwatch sw = Stopwatch.StartNew();
+            int count = 0;
+            string detail = "";
+            while (true) {
+                if (byWindow) {
+                    string foundTitle;
+                    IntPtr hwnd = FindWindowByTarget(window, out foundTitle);
+                    bool hit = hwnd != IntPtr.Zero;
+                    if (hit && needForeground) hit = (GetForegroundWindow() == hwnd);
+                    count = hit ? 1 : 0;
+                    if (hit) {
+                        detail = foundTitle;
+                        res["hwnd"] = hwnd.ToInt64();
+                    }
+                } else {
+                    var inspectReq = new Dictionary<string, object> {
+                        { "target", ToStr(req, "scope", "active_window") },
+                        { "maxDepth", ToInt(req, "max_depth", 8) },
+                        { "filter", filter },
+                        { "interactiveOnly", ToBool(req, "interactive_only", false) }
+                    };
+                    var inspectRes = InspectUI(inspectReq);
+                    count = ToInt(inspectRes, "count", 0);
+                }
+
+                if (present ? count > 0 : count == 0) {
+                    sw.Stop();
+                    res["status"] = "ok";
+                    res["count"] = count;
+                    res["waitedMs"] = sw.ElapsedMilliseconds;
+                    if (detail.Length > 0) res["title"] = detail;
+                    return res;
+                }
+
+                if (sw.ElapsedMilliseconds >= timeoutMs) break;
+                PreciseSleep(pollMs);
+            }
+
+            sw.Stop();
+            res["status"] = "error";
+            res["count"] = count;
+            res["waitedMs"] = sw.ElapsedMilliseconds;
+            res["message"] = present
+                ? "not found within " + timeoutMs + "ms: " + (byWindow ? window : filter)
+                : "still present after " + timeoutMs + "ms: " + (byWindow ? window : filter);
+            return res;
+        }
+
+        // Replaces win+r, typing a name, enter, a blind sleep and a screenshot to check.
+        // A failure to start is reported as such, not silently matched to some other window.
+        static Dictionary<string, object> LaunchApp(Dictionary<string, object> req) {
+            string app = ToStr(req, "app", ToStr(req, "path", ToStr(req, "target", "")));
+            string arguments = ToStr(req, "args", ToStr(req, "arguments", ""));
+            string expect = ToStr(req, "expect_window", ToStr(req, "expectWindow", ""));
+            bool reuse = ToBool(req, "reuse_existing", ToBool(req, "reuseExisting", true));
+            bool focus = ToBool(req, "focus", true);
+            int timeoutMs = ToInt(req, "timeout_ms", ToInt(req, "timeoutMs", 10000));
+
+            var res = new Dictionary<string, object>();
+            res["action"] = "launch";
+            res["app"] = app;
+
+            if (string.IsNullOrEmpty(app)) {
+                res["status"] = "error";
+                res["message"] = "launch needs an app: executable name, full path, document or URI";
+                return res;
+            }
+
+            string baseName = app;
+            try {
+                string bn = Path.GetFileNameWithoutExtension(app);
+                if (!string.IsNullOrEmpty(bn)) baseName = bn;
+            } catch {}
+            if (string.IsNullOrEmpty(expect)) expect = baseName;
+            res["expectWindow"] = expect;
+
+            IntPtr existing = FindLaunchedWindow(expect, baseName, -1);
+            bool reused = false;
+            int startedPid = -1;
+
+            if (reuse && existing != IntPtr.Zero) {
+                reused = true;
+            } else {
+                try {
+                    ProcessStartInfo psi = new ProcessStartInfo(app);
+                    if (!string.IsNullOrEmpty(arguments)) psi.Arguments = arguments;
+                    psi.UseShellExecute = true;
+                    Process started = Process.Start(psi);
+                    if (started != null) {
+                        try { startedPid = started.Id; } catch {}
+                    }
+                } catch (Exception ex) {
+                    res["status"] = "error";
+                    res["message"] = "could not start " + app + ": " + ex.Message;
+                    return res;
+                }
+            }
+
+            // Poll for the app window, but bail out early if Windows puts up a startup
+            // error dialog for it - that dialog's title contains the exe name, so a
+            // plain title match would otherwise report a broken app as a success.
+            Stopwatch sw = Stopwatch.StartNew();
+            IntPtr hwnd = IntPtr.Zero;
+            while (true) {
+                string errTitle;
+                IntPtr errDlg = FindStartupErrorDialog(baseName, out errTitle);
+                if (errDlg != IntPtr.Zero) {
+                    sw.Stop();
+                    res["status"] = "error";
+                    res["message"] = "the app failed to start: " + errTitle;
+                    res["errorDialog"] = errTitle;
+                    res["errorText"] = ReadWindowStaticText(errDlg);
+                    res["hwnd"] = errDlg.ToInt64();
+                    res["waitedMs"] = sw.ElapsedMilliseconds;
+                    return res;
+                }
+
+                hwnd = FindLaunchedWindow(expect, baseName, startedPid);
+                if (hwnd != IntPtr.Zero) break;
+                if (sw.ElapsedMilliseconds >= timeoutMs) break;
+                PreciseSleep(50);
+            }
+            sw.Stop();
+
+            if (hwnd == IntPtr.Zero) {
+                res["status"] = "error";
+                res["message"] = "started but no window matching " + expect + " appeared within " + timeoutMs + "ms";
+                res["waitedMs"] = sw.ElapsedMilliseconds;
+                return res;
+            }
+
+            StringBuilder titleSb = new StringBuilder(512);
+            GetWindowText(hwnd, titleSb, 512);
+
+            res["reused"] = reused;
+            res["waitedMs"] = sw.ElapsedMilliseconds;
+            res["title"] = titleSb.ToString();
+            res["hwnd"] = hwnd.ToInt64();
+
+            if (focus) {
+                var focusReq = new Dictionary<string, object> { { "target", hwnd.ToInt64().ToString() }, { "action", "focus" } };
+                var focusRes = FocusWindow(focusReq);
+                res["focused"] = ToStr(focusRes, "status", "") == "ok";
+                if (focusRes.ContainsKey("foreground")) res["foreground"] = focusRes["foreground"];
+            }
+
+            res["status"] = "ok";
+            return res;
+        }
+
+        // A window that belongs to the launched app: by PID when the launcher handed us
+        // one, otherwise by process name, otherwise by title substring. Startup error
+        // dialogs are never treated as the app's window.
+        static IntPtr FindLaunchedWindow(string expect, string baseName, int pid) {
+            IntPtr byPid = IntPtr.Zero;
+            IntPtr byProc = IntPtr.Zero;
+            IntPtr byTitle = IntPtr.Zero;
+
+            EnumWindows((hWnd, lParam) => {
+                if (!IsWindowVisible(hWnd)) return true;
+                StringBuilder sb = new StringBuilder(512);
+                GetWindowText(hWnd, sb, 512);
+                string title = sb.ToString();
+                if (string.IsNullOrWhiteSpace(title)) return true;
+                if (IsErrorDialogTitle(title)) return true;
+
+                uint wpid;
+                GetWindowThreadProcessId(hWnd, out wpid);
+                if (pid > 0 && (int)wpid == pid) { byPid = hWnd; return false; }
+
+                if (byProc == IntPtr.Zero) {
+                    string proc = "";
+                    try { proc = Process.GetProcessById((int)wpid).ProcessName; } catch {}
+                    if (!string.IsNullOrEmpty(proc) &&
+                        proc.Equals(baseName, StringComparison.OrdinalIgnoreCase)) {
+                        byProc = hWnd;
+                    }
+                }
+                if (byTitle == IntPtr.Zero &&
+                    title.IndexOf(expect, StringComparison.OrdinalIgnoreCase) >= 0) {
+                    byTitle = hWnd;
+                }
+                return true;
+            }, IntPtr.Zero);
+
+            if (byPid != IntPtr.Zero) return byPid;
+            if (byProc != IntPtr.Zero) return byProc;
+            return byTitle;
+        }
+
+        static bool IsErrorDialogTitle(string title) {
+            return title.IndexOf("System Error", StringComparison.OrdinalIgnoreCase) >= 0
+                || title.IndexOf("Application Error", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        static IntPtr FindStartupErrorDialog(string baseName, out string foundTitle) {
+            IntPtr found = IntPtr.Zero;
+            string title = "";
+            EnumWindows((hWnd, lParam) => {
+                if (!IsWindowVisible(hWnd)) return true;
+                StringBuilder sb = new StringBuilder(512);
+                GetWindowText(hWnd, sb, 512);
+                string t = sb.ToString();
+                if (string.IsNullOrWhiteSpace(t)) return true;
+                if (IsErrorDialogTitle(t) && t.IndexOf(baseName, StringComparison.OrdinalIgnoreCase) >= 0) {
+                    found = hWnd; title = t; return false;
+                }
+                return true;
+            }, IntPtr.Zero);
+            foundTitle = title;
+            return found;
+        }
+
+        // Reads what an app actually contains, straight out of UI Automation. This is
+        // how a typed or pasted value gets confirmed: one text answer instead of a
+        // screenshot the model has to look at.
+        static Dictionary<string, object> ReadText(Dictionary<string, object> req) {
+            string filter = ToStr(req, "filter", "");
+            string target = ToStr(req, "target", "focused").ToLower();
+            int maxChars = ToInt(req, "max_chars", ToInt(req, "maxChars", 20000));
+
+            var res = new Dictionary<string, object>();
+            res["action"] = "read_text";
+
+            AutomationElement root = null;
+            IntPtr fg = GetForegroundWindow();
+            try { if (fg != IntPtr.Zero) root = AutomationElement.FromHandle(fg); } catch {}
+
+            AutomationElement el = null;
+            string how = "";
+
+            if (target == "focused" && filter.Length == 0) {
+                try { el = AutomationElement.FocusedElement; how = "focused"; } catch {}
+            }
+
+            if (el == null && root != null && filter.Length > 0) {
+                el = FindElementByFilter(root, filter);
+                how = "filter";
+            }
+
+            if (el == null && root != null) {
+                el = FindFirstTextHolder(root);
+                how = el != null ? "first-editable" : "";
+            }
+
+            if (el == null) {
+                res["status"] = "error";
+                res["message"] = filter.Length > 0
+                    ? "no element matching: " + filter
+                    : "no readable element in the foreground window";
+                return res;
+            }
+
+            string text = ExtractElementText(el);
+            if (text == null) text = "";
+            if (text.Length > maxChars) text = text.Substring(0, maxChars);
+
+            res["status"] = "ok";
+            res["text"] = text;
+            res["length"] = text.Length;
+            res["source"] = how;
+            try {
+                res["element"] = el.Current.Name;
+                res["type"] = el.Current.ControlType != null
+                    ? el.Current.ControlType.ProgrammaticName.Replace("ControlType.", "") : "";
+                res["automationId"] = el.Current.AutomationId ?? "";
+            } catch {}
+
+            if (req.ContainsKey("expect") && req["expect"] != null) {
+                string expect = req["expect"].ToString();
+                bool match = text.IndexOf(expect, StringComparison.Ordinal) >= 0;
+                res["expect"] = expect;
+                res["matched"] = match;
+                if (!match) {
+                    res["status"] = "error";
+                    res["message"] = "text does not contain: " + expect;
+                }
+            }
+
+            return res;
+        }
+
+        static string ExtractElementText(AutomationElement el) {
+            if (el == null) return "";
+            try {
+                object vp;
+                if (el.TryGetCurrentPattern(ValuePattern.Pattern, out vp)) {
+                    string v = ((ValuePattern)vp).Current.Value;
+                    if (!string.IsNullOrEmpty(v)) return v;
+                }
+            } catch {}
+            try {
+                object tp;
+                if (el.TryGetCurrentPattern(TextPattern.Pattern, out tp)) {
+                    string v = ((TextPattern)tp).DocumentRange.GetText(-1);
+                    if (!string.IsNullOrEmpty(v)) return v;
+                }
+            } catch {}
+            try {
+                string n = el.Current.Name;
+                if (!string.IsNullOrEmpty(n)) return n;
+            } catch {}
+            return "";
+        }
+
+        // First descendant that can actually hold text (Edit or Document), preferring
+        // one that already has a value.
+        static AutomationElement FindFirstTextHolder(AutomationElement root) {
+            try {
+                var cond = new OrCondition(
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Edit),
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Document));
+                var all = root.FindAll(TreeScope.Descendants, cond);
+                AutomationElement firstAny = null;
+                foreach (AutomationElement candidate in all) {
+                    if (firstAny == null) firstAny = candidate;
+                    string t = ExtractElementText(candidate);
+                    if (!string.IsNullOrEmpty(t)) return candidate;
+                }
+                return firstAny;
+            } catch {
+                return null;
+            }
+        }
+
+        // Id, exact name and control type are resolved by UI Automation itself in one
+        // call. The manual walk is the last resort and is capped: it costs seconds.
+        static AutomationElement FindElementByFilter(AutomationElement root, string filter) {
+            if (root == null || string.IsNullOrEmpty(filter)) return null;
+
+            try {
+                var byId = root.FindFirst(TreeScope.Descendants,
+                    new PropertyCondition(AutomationElement.AutomationIdProperty, filter));
+                if (byId != null) return byId;
+            } catch {}
+
+            try {
+                var byName = root.FindFirst(TreeScope.Descendants,
+                    new PropertyCondition(AutomationElement.NameProperty, filter));
+                if (byName != null) return byName;
+            } catch {}
+
+            ControlType ct = ControlTypeByName(filter);
+            if (ct != null) {
+                try {
+                    var byType = root.FindFirst(TreeScope.Descendants,
+                        new PropertyCondition(AutomationElement.ControlTypeProperty, ct));
+                    if (byType != null) return byType;
+                } catch {}
+            }
+
+            try {
+                var all = root.FindAll(TreeScope.Descendants, Condition.TrueCondition);
+                int seen = 0;
+                foreach (AutomationElement candidate in all) {
+                    if (++seen > 250) break;
+                    try {
+                        var cur = candidate.Current;
+                        string name = cur.Name ?? "";
+                        string autoId = cur.AutomationId ?? "";
+                        if (name.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                            autoId.IndexOf(filter, StringComparison.OrdinalIgnoreCase) >= 0) {
+                            return candidate;
+                        }
+                    } catch {}
+                }
+            } catch {}
+            return null;
+        }
+
+        static ControlType ControlTypeByName(string name) {
+            switch (name.ToLower()) {
+                case "button": return ControlType.Button;
+                case "edit": return ControlType.Edit;
+                case "document": return ControlType.Document;
+                case "text": return ControlType.Text;
+                case "combobox": return ControlType.ComboBox;
+                case "list": return ControlType.List;
+                case "listitem": return ControlType.ListItem;
+                case "tab": return ControlType.Tab;
+                case "tabitem": return ControlType.TabItem;
+                case "checkbox": return ControlType.CheckBox;
+                case "radiobutton": return ControlType.RadioButton;
+                case "menuitem": return ControlType.MenuItem;
+                case "menu": return ControlType.Menu;
+                case "hyperlink": return ControlType.Hyperlink;
+                case "window": return ControlType.Window;
+                case "pane": return ControlType.Pane;
+                case "group": return ControlType.Group;
+                case "image": return ControlType.Image;
+                case "tree": return ControlType.Tree;
+                case "treeitem": return ControlType.TreeItem;
+                case "table": return ControlType.Table;
+                case "datagrid": return ControlType.DataGrid;
+                case "toolbar": return ControlType.ToolBar;
+                case "spinner": return ControlType.Spinner;
+                case "slider": return ControlType.Slider;
+                case "custom": return ControlType.Custom;
+                default: return null;
+            }
+        }
+
+        // Joins the static text of a window, so an error dialog can explain itself
+        // without the caller needing a screenshot.
+        static string ReadWindowStaticText(IntPtr hwnd) {
+            try {
+                AutomationElement root = AutomationElement.FromHandle(hwnd);
+                if (root == null) return "";
+                var parts = new List<string>();
+                var texts = root.FindAll(TreeScope.Descendants,
+                    new PropertyCondition(AutomationElement.ControlTypeProperty, ControlType.Text));
+                foreach (AutomationElement el in texts) {
+                    try {
+                        string n = el.Current.Name;
+                        if (!string.IsNullOrWhiteSpace(n)) parts.Add(n.Trim());
+                    } catch {}
+                }
+                return string.Join(" ", parts.ToArray());
+            } catch {
+                return "";
+            }
+        }
+
+        // Single window lookup shared by focus, wait_for and launch: matches an HWND
+        // given as a number, then a window title substring, then a process name.
+        static IntPtr FindWindowByTarget(string target, out string foundTitle) {
+            foundTitle = "";
+            if (string.IsNullOrEmpty(target)) return IntPtr.Zero;
+
+            long parsedHwnd;
+            if (long.TryParse(target, out parsedHwnd) && parsedHwnd > 0) {
+                IntPtr direct = new IntPtr(parsedHwnd);
+                if (IsWindow(direct)) {
+                    StringBuilder sbd = new StringBuilder(512);
+                    GetWindowText(direct, sbd, 512);
+                    foundTitle = sbd.ToString();
+                    return direct;
+                }
+            }
+
+            IntPtr byTitle = IntPtr.Zero;
+            string byTitleText = "";
+            IntPtr byProc = IntPtr.Zero;
+            string byProcText = "";
+
+            EnumWindows((hWnd, lParam) => {
+                if (!IsWindowVisible(hWnd)) return true;
+                StringBuilder sb = new StringBuilder(512);
+                GetWindowText(hWnd, sb, 512);
+                string title = sb.ToString();
+                if (string.IsNullOrWhiteSpace(title)) return true;
+
+                if (title.IndexOf(target, StringComparison.OrdinalIgnoreCase) >= 0) {
+                    if (byTitle == IntPtr.Zero) { byTitle = hWnd; byTitleText = title; }
+                    return false;
+                }
+
+                if (byProc == IntPtr.Zero) {
+                    uint pid;
+                    GetWindowThreadProcessId(hWnd, out pid);
+                    string proc = "";
+                    try { proc = Process.GetProcessById((int)pid).ProcessName; } catch {}
+                    if (!string.IsNullOrEmpty(proc) && proc.IndexOf(target, StringComparison.OrdinalIgnoreCase) >= 0) {
+                        byProc = hWnd; byProcText = title;
+                    }
+                }
+                return true;
+            }, IntPtr.Zero);
+
+            if (byTitle != IntPtr.Zero) { foundTitle = byTitleText; return byTitle; }
+            if (byProc != IntPtr.Zero) { foundTitle = byProcText; return byProc; }
+            return IntPtr.Zero;
         }
 
         static Dictionary<string, object> ListWindows() {
@@ -908,32 +1786,11 @@ namespace FastComputerUse {
         }
 
         static Dictionary<string, object> FocusWindow(Dictionary<string, object> req) {
-            string target = req.ContainsKey("target") && req["target"] != null ? req["target"].ToString() : "";
-            string action = req.ContainsKey("action") && req["action"] != null ? req["action"].ToString().ToLower() : "focus";
+            string target = ToStr(req, "target", "");
+            string action = ToStr(req, "action", "focus").ToLower();
 
-            IntPtr targetHwnd = IntPtr.Zero;
-            string foundTitle = "";
-
-            EnumWindows((hWnd, lParam) => {
-                if (!IsWindowVisible(hWnd)) return true;
-                StringBuilder sb = new StringBuilder(512);
-                GetWindowText(hWnd, sb, 512);
-                string title = sb.ToString();
-                if (string.IsNullOrWhiteSpace(title)) return true;
-
-                uint pid;
-                GetWindowThreadProcessId(hWnd, out pid);
-                string proc = "";
-                try { proc = Process.GetProcessById((int)pid).ProcessName; } catch {}
-
-                if (title.IndexOf(target, StringComparison.OrdinalIgnoreCase) >= 0 ||
-                    proc.IndexOf(target, StringComparison.OrdinalIgnoreCase) >= 0) {
-                    targetHwnd = hWnd;
-                    foundTitle = title;
-                    return false;
-                }
-                return true;
-            }, IntPtr.Zero);
+            string foundTitle;
+            IntPtr targetHwnd = FindWindowByTarget(target, out foundTitle);
 
             var res = new Dictionary<string, object>();
             if (targetHwnd == IntPtr.Zero) {
@@ -941,6 +1798,11 @@ namespace FastComputerUse {
                 res["message"] = "Window not found matching: " + target;
                 return res;
             }
+
+            res["status"] = "ok";
+            res["hwnd"] = targetHwnd.ToInt64();
+            res["title"] = foundTitle;
+            res["action"] = action;
 
             if (action == "minimize") {
                 ShowWindowAsync(targetHwnd, SW_MINIMIZE);
@@ -951,15 +1813,49 @@ namespace FastComputerUse {
             } else if (action == "close") {
                 SendMessage(targetHwnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
             } else {
-                if (IsIconic(targetHwnd)) ShowWindowAsync(targetHwnd, SW_RESTORE);
-                SetForegroundWindow(targetHwnd);
+                bool got = ForceForeground(targetHwnd);
+                res["foreground"] = got;
+                if (!got) {
+                    res["status"] = "error";
+                    res["message"] = "could not bring the window to the foreground: " + foundTitle;
+                }
             }
 
-            res["status"] = "ok";
-            res["hwnd"] = targetHwnd.ToInt64();
-            res["title"] = foundTitle;
-            res["action"] = action;
             return res;
+        }
+
+        // A bare SetForegroundWindow is refused, silently, whenever the caller does not
+        // already own the foreground window. Attaching to the foreground thread's input
+        // queue lifts that restriction; the result is then read back rather than assumed.
+        static bool ForceForeground(IntPtr hWnd) {
+            if (hWnd == IntPtr.Zero) return false;
+            if (GetForegroundWindow() == hWnd) return true;
+            if (IsIconic(hWnd)) ShowWindowAsync(hWnd, SW_RESTORE);
+
+            IntPtr fg = GetForegroundWindow();
+            uint fgThread = 0;
+            uint pidIgnored;
+            if (fg != IntPtr.Zero) fgThread = GetWindowThreadProcessId(fg, out pidIgnored);
+            uint selfThread = GetCurrentThreadId();
+            bool attached = false;
+
+            try {
+                if (fgThread != 0 && fgThread != selfThread) {
+                    attached = AttachThreadInput(selfThread, fgThread, true);
+                }
+                for (int attempt = 0; attempt < 3; attempt++) {
+                    BringWindowToTop(hWnd);
+                    SetForegroundWindow(hWnd);
+                    if (GetForegroundWindow() == hWnd) return true;
+                    SwitchToThisWindow(hWnd, true);
+                    if (GetForegroundWindow() == hWnd) return true;
+                    PreciseSleep(30);
+                }
+            } finally {
+                if (attached) AttachThreadInput(selfThread, fgThread, false);
+            }
+
+            return GetForegroundWindow() == hWnd;
         }
 
         static Dictionary<string, object> SetWindowPosCommand(Dictionary<string, object> req) {
@@ -1101,24 +1997,38 @@ namespace FastComputerUse {
         }
 
         static Dictionary<string, object> ClickUIElement(Dictionary<string, object> req) {
-            string name = req.ContainsKey("name") && req["name"] != null ? req["name"].ToString() : "";
-            string type = req.ContainsKey("type") && req["type"] != null ? req["type"].ToString() : "";
+            string name = ToStr(req, "name", ToStr(req, "filter", ""));
+            // "control_type" rather than "type": inside a batch, "type" is the routing key.
+            string type = ToStr(req, "control_type", ToStr(req, "controlType", ""));
+            string autoId = ToStr(req, "automation_id", ToStr(req, "automationId", ""));
 
-            var inspectReq = new Dictionary<string, object> { { "target", "active_window" } };
+            var inspectReq = new Dictionary<string, object> {
+                { "target", "active_window" },
+                { "interactiveOnly", ToBool(req, "interactive_only", false) },
+                { "maxDepth", ToInt(req, "max_depth", 8) }
+            };
             var inspectRes = InspectUI(inspectReq);
             var elements = inspectRes["elements"] as List<Dictionary<string, object>>;
 
             Dictionary<string, object> targetElem = null;
             if (elements != null) {
                 foreach (var el in elements) {
-                    string elName = el.ContainsKey("name") && el["name"] != null ? el["name"].ToString() : "";
-                    string elType = el.ContainsKey("type") && el["type"] != null ? el["type"].ToString() : "";
+                    string elName = ToStr(el, "name", "");
+                    string elType = ToStr(el, "type", "");
+                    string elId = ToStr(el, "automationId", "");
 
-                    if (!string.IsNullOrEmpty(name) && elName.IndexOf(name, StringComparison.OrdinalIgnoreCase) >= 0) {
-                        if (string.IsNullOrEmpty(type) || elType.Equals(type, StringComparison.OrdinalIgnoreCase)) {
-                            targetElem = el;
-                            break;
-                        }
+                    bool hit;
+                    if (autoId.Length > 0) {
+                        hit = elId.Equals(autoId, StringComparison.OrdinalIgnoreCase);
+                    } else if (name.Length > 0) {
+                        hit = elName.IndexOf(name, StringComparison.OrdinalIgnoreCase) >= 0;
+                    } else {
+                        hit = type.Length > 0;
+                    }
+
+                    if (hit && (type.Length == 0 || elType.Equals(type, StringComparison.OrdinalIgnoreCase))) {
+                        targetElem = el;
+                        break;
                     }
                 }
             }
@@ -1126,7 +2036,9 @@ namespace FastComputerUse {
             var res = new Dictionary<string, object>();
             if (targetElem == null) {
                 res["status"] = "error";
-                res["message"] = "Element not found matching name: " + name;
+                res["message"] = "Element not found matching "
+                    + (autoId.Length > 0 ? "automation_id: " + autoId : "name: " + name)
+                    + (type.Length > 0 ? " (control_type: " + type + ")" : "");
                 return res;
             }
 

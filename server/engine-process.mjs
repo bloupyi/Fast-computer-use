@@ -17,6 +17,9 @@ export class FastEngineClient {
     this.ready = false;
     this.initPromise = null;
     this.restarting = false;
+    // The engine answers one line per command, in order. A timed-out command's reply
+    // is still coming: count it so it gets dropped instead of served to the next caller.
+    this.orphanResponses = 0;
   }
 
   async start() {
@@ -57,6 +60,11 @@ export class FastEngineClient {
             } catch (err) {
               // Ignore if not json
             }
+          }
+
+          if (this.orphanResponses > 0) {
+            this.orphanResponses--;
+            return;
           }
 
           if (this.currentTask) {
@@ -113,6 +121,8 @@ export class FastEngineClient {
       clearTimeout(task.timeout);
       task.reject(new Error('FastEngine process terminated unexpectedly'));
     }
+
+    this.orphanResponses = 0;
   }
 
   async send(command, timeoutMs = 15000) {
@@ -122,6 +132,7 @@ export class FastEngineClient {
       const timeout = setTimeout(() => {
         if (this.currentTask && this.currentTask.timeout === timeout) {
           this.currentTask = null;
+          this.orphanResponses++;
           rejectTask(new Error(`Command timed out after ${timeoutMs}ms: ${JSON.stringify(command)}`));
           this._processNext();
         }
