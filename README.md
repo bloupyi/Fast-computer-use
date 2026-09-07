@@ -175,8 +175,16 @@ coordinates. Parameters: `target` (`active_window` / `cursor` / `screen`),
 ### `mouse_action`
 
 `click`, `double_click`, `triple_click`, `right_click`, `middle_click`, `move`,
-`drag` (`to_x`/`to_y`), `scroll` (`scroll_amount`). `smooth: true` interpolates the
-trajectory; `duration_ms` tunes it (default 40).
+`drag` (`to_x`/`to_y`), `scroll` (`scroll_amount`), `mouse_down`, `mouse_up`.
+`smooth: true` interpolates the trajectory; `duration_ms` tunes it (40 for a move,
+200 for a drag).
+
+Movement goes through `SendInput` as absolute virtual-desktop coordinates, not
+`SetCursorPos`, so an app receiving a drag sees a real gesture. Two ways to drag:
+`action: "drag"` for the whole thing in one step, or `mouse_down` / moves /
+`mouse_up` when you need to steer the path - the button genuinely stays held
+between them. Tune `grab_ms` and `drop_ms` if a target misses the grab or the drop
+lands short.
 
 ### `keyboard_action`
 

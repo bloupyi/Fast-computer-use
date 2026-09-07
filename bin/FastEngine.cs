@@ -136,6 +136,9 @@ namespace FastComputerUse {
         const uint INPUT_MOUSE = 0;
         const uint INPUT_KEYBOARD = 1;
 
+        const uint MOUSEEVENTF_MOVE = 0x0001;
+        const uint MOUSEEVENTF_ABSOLUTE = 0x8000;
+        const uint MOUSEEVENTF_VIRTUALDESK = 0x4000;
         const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
         const uint MOUSEEVENTF_LEFTUP = 0x0004;
         const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
@@ -197,11 +200,11 @@ namespace FastComputerUse {
                 return;
             }
 
-            Console.WriteLine("FastEngine v1.1.0. Usage: FastEngine.exe --daemon OR FastEngine.exe <cmd> '<json_payload>'");
+            Console.WriteLine("FastEngine v1.1.1. Usage: FastEngine.exe --daemon OR FastEngine.exe <cmd> '<json_payload>'");
         }
 
         static void RunDaemon() {
-            Console.WriteLine("{\"ready\":true,\"version\":\"1.1.0\"}");
+            Console.WriteLine("{\"ready\":true,\"version\":\"1.1.1\"}");
             Console.Out.Flush();
 
             string line;
@@ -271,6 +274,8 @@ namespace FastComputerUse {
                         if (mouseAct == "move" || mouseAct == "mouse_move") return MouseMove(req);
                         if (mouseAct == "drag" || mouseAct == "mouse_drag") return MouseDrag(req);
                         if (mouseAct == "scroll" || mouseAct == "mouse_scroll") return MouseScroll(req);
+                        if (mouseAct == "mouse_down" || mouseAct == "button_down" || mouseAct == "down") return MouseButton(req, true);
+                        if (mouseAct == "mouse_up" || mouseAct == "button_up" || mouseAct == "up") return MouseButton(req, false);
                         return MouseClick(req);
 
                     case "mouse_click":
@@ -280,6 +285,14 @@ namespace FastComputerUse {
                     case "mouse_move":
                     case "move":
                         return MouseMove(req);
+
+                    case "mouse_down":
+                    case "button_down":
+                        return MouseButton(req, true);
+
+                    case "mouse_up":
+                    case "button_up":
+                        return MouseButton(req, false);
 
                     case "mouse_drag":
                     case "drag":
@@ -688,6 +701,87 @@ namespace FastComputerUse {
             return codecs[0];
         }
 
+        // Which buttons the caller is currently holding down. A drag composed of
+        // mouse_down / move / mouse_up spans several commands, so the press has to
+        // outlive the call that made it.
+        static uint heldButtons = 0;
+
+        static uint DownFlagFor(string button) {
+            if (button == "right") return MOUSEEVENTF_RIGHTDOWN;
+            if (button == "middle") return MOUSEEVENTF_MIDDLEDOWN;
+            return MOUSEEVENTF_LEFTDOWN;
+        }
+
+        static uint UpFlagFor(string button) {
+            if (button == "right") return MOUSEEVENTF_RIGHTUP;
+            if (button == "middle") return MOUSEEVENTF_MIDDLEUP;
+            return MOUSEEVENTF_LEFTUP;
+        }
+
+        static void SendMouseFlag(uint flag, uint data) {
+            INPUT[] inputs = new INPUT[1];
+            inputs[0].type = INPUT_MOUSE;
+            inputs[0].mkhi.mi.dwFlags = flag;
+            inputs[0].mkhi.mi.mouseData = data;
+            SendInput(1, inputs, Marshal.SizeOf(typeof(INPUT)));
+        }
+
+        // Moves through the real input stream rather than SetCursorPos. An app only
+        // follows a drag if it sees genuine move input while the button is down;
+        // teleporting the cursor is not the same gesture.
+        static void MoveCursorTo(int x, int y) {
+            Rectangle vs = SystemInformation.VirtualScreen;
+            int nx = (int)Math.Round((x - vs.Left) * 65535.0 / Math.Max(1, vs.Width - 1));
+            int ny = (int)Math.Round((y - vs.Top) * 65535.0 / Math.Max(1, vs.Height - 1));
+
+            INPUT[] inputs = new INPUT[1];
+            inputs[0].type = INPUT_MOUSE;
+            inputs[0].mkhi.mi.dx = nx;
+            inputs[0].mkhi.mi.dy = ny;
+            inputs[0].mkhi.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+            SendInput(1, inputs, Marshal.SizeOf(typeof(INPUT)));
+
+            // Absolute normalisation rounds; land the exact pixel. SetCursorPos raises
+            // a move message too, so this does not break an in-flight drag.
+            POINT now;
+            GetCursorPos(out now);
+            if (now.X != x || now.Y != y) SetCursorPos(x, y);
+        }
+
+        // Presses or releases a button and leaves it in that state, so the caller can
+        // move in between. Without this, mouse_down fell through to a full click.
+        static Dictionary<string, object> MouseButton(Dictionary<string, object> req, bool down) {
+            string btn = ToStr(req, "button", "left").ToLower();
+            if (btn == "double" || btn == "double_click" || btn == "triple" || btn == "triple_click") btn = "left";
+
+            if (req.ContainsKey("x") && req.ContainsKey("y") && req["x"] != null && req["y"] != null) {
+                MoveCursorTo(ToInt(req, "x", 0), ToInt(req, "y", 0));
+                int settle = ToInt(req, "settle_ms", 3);
+                if (settle > 0) PreciseSleep(settle);
+            }
+
+            uint flag;
+            if (down) {
+                flag = DownFlagFor(btn);
+                heldButtons |= flag;
+            } else {
+                flag = UpFlagFor(btn);
+                heldButtons &= ~DownFlagFor(btn);
+            }
+            SendMouseFlag(flag, 0);
+
+            POINT pt;
+            GetCursorPos(out pt);
+            var res = new Dictionary<string, object>();
+            res["status"] = "ok";
+            res["action"] = down ? "mouse_down" : "mouse_up";
+            res["button"] = btn;
+            res["held"] = heldButtons != 0;
+            res["x"] = pt.X;
+            res["y"] = pt.Y;
+            return res;
+        }
+
         static Dictionary<string, object> MouseMove(Dictionary<string, object> req) {
             int x = ToInt(req, "x", 0);
             int y = ToInt(req, "y", 0);
@@ -705,26 +799,25 @@ namespace FastComputerUse {
                 for (int i = 1; i <= steps; i++) {
                     int cx = start.X + (x - start.X) * i / steps;
                     int cy = start.Y + (y - start.Y) * i / steps;
-                    SetCursorPos(cx, cy);
+                    MoveCursorTo(cx, cy);
                     if (stepDelay > 0) PreciseSleep(stepDelay);
                 }
-                SetCursorPos(x, y);
+                MoveCursorTo(x, y);
             } else {
-                SetCursorPos(x, y);
+                MoveCursorTo(x, y);
             }
 
             var res = new Dictionary<string, object>();
             res["status"] = "ok";
             res["x"] = x;
             res["y"] = y;
+            if (heldButtons != 0) res["held"] = true;
             return res;
         }
 
         static Dictionary<string, object> MouseClick(Dictionary<string, object> req) {
             if (req.ContainsKey("x") && req.ContainsKey("y") && req["x"] != null && req["y"] != null) {
-                int x = Convert.ToInt32(req["x"]);
-                int y = Convert.ToInt32(req["y"]);
-                SetCursorPos(x, y);
+                MoveCursorTo(ToInt(req, "x", 0), ToInt(req, "y", 0));
                 int settle = ToInt(req, "settle_ms", 3);
                 if (settle > 0) PreciseSleep(settle);
             }
@@ -754,9 +847,9 @@ namespace FastComputerUse {
             if (action == "triple_click" || btn == "triple" || btn == "triple_click") clicks = 3;
 
             for (int i = 0; i < clicks; i++) {
-                mouse_event(downFlag, 0, 0, 0, UIntPtr.Zero);
+                SendMouseFlag(downFlag, 0);
                 PreciseSleep(10);
-                mouse_event(upFlag, 0, 0, 0, UIntPtr.Zero);
+                SendMouseFlag(upFlag, 0);
                 if (i < clicks - 1) PreciseSleep(50);
             }
 
@@ -796,29 +889,46 @@ namespace FastComputerUse {
             else if (req.ContainsKey("toY")) y2 = Convert.ToInt32(req["toY"]);
             else if (req.ContainsKey("to_y")) y2 = Convert.ToInt32(req["to_y"]);
 
-            int duration = req.ContainsKey("durationMs") ? Convert.ToInt32(req["durationMs"]) : 100;
+            int duration = ToInt(req, "durationMs", ToInt(req, "duration_ms", 200));
+            string btn = ToStr(req, "button", "left").ToLower();
+            uint downFlag = DownFlagFor(btn);
+            uint upFlag = UpFlagFor(btn);
 
-            SetCursorPos(x1, y1);
-            PreciseSleep(20);
-            mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, UIntPtr.Zero);
-            PreciseSleep(20);
+            // Land, settle, then press. Dropping the button on the same tick as the
+            // move makes some targets miss the grab entirely.
+            MoveCursorTo(x1, y1);
+            PreciseSleep(ToInt(req, "grab_ms", 40));
+            SendMouseFlag(downFlag, 0);
+            heldButtons |= downFlag;
+            PreciseSleep(ToInt(req, "hold_ms", 40));
 
-            int steps = Math.Max(5, duration / 10);
+            double dist = Math.Sqrt(Math.Pow(x2 - x1, 2) + Math.Pow(y2 - y1, 2));
+            int steps = ToInt(req, "steps", Math.Max(10, Math.Min(60, (int)(dist / 12))));
+            int stepDelay = Math.Max(0, duration / Math.Max(1, steps));
             for (int i = 1; i <= steps; i++) {
                 int cx = x1 + (x2 - x1) * i / steps;
                 int cy = y1 + (y2 - y1) * i / steps;
-                SetCursorPos(cx, cy);
-                PreciseSleep(duration / steps);
+                MoveCursorTo(cx, cy);
+                if (stepDelay > 0) PreciseSleep(stepDelay);
             }
 
-            SetCursorPos(x2, y2);
-            PreciseSleep(20);
-            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, UIntPtr.Zero);
+            MoveCursorTo(x2, y2);
+            // Let the target process the final position before the button comes up,
+            // otherwise the drop registers at the previous point.
+            PreciseSleep(ToInt(req, "drop_ms", 60));
+            SendMouseFlag(upFlag, 0);
+            heldButtons &= ~downFlag;
 
+            POINT endPt;
+            GetCursorPos(out endPt);
             var res = new Dictionary<string, object>();
             res["status"] = "ok";
+            res["action"] = "drag";
+            res["button"] = btn;
+            res["steps"] = steps;
             res["from"] = new Dictionary<string, object> { { "x", x1 }, { "y", y1 } };
             res["to"] = new Dictionary<string, object> { { "x", x2 }, { "y", y2 } };
+            res["landed"] = new Dictionary<string, object> { { "x", endPt.X }, { "y", endPt.Y } };
             return res;
         }
 
@@ -831,8 +941,8 @@ namespace FastComputerUse {
             bool horizontal = req.ContainsKey("horizontal") && Convert.ToBoolean(req["horizontal"]);
 
             if (req.ContainsKey("x") && req.ContainsKey("y") && req["x"] != null && req["y"] != null) {
-                SetCursorPos(Convert.ToInt32(req["x"]), Convert.ToInt32(req["y"]));
-                PreciseSleep(5);
+                MoveCursorTo(ToInt(req, "x", 0), ToInt(req, "y", 0));
+                PreciseSleep(3);
             }
 
             uint flag = horizontal ? MOUSEEVENTF_HWHEEL : MOUSEEVENTF_WHEEL;

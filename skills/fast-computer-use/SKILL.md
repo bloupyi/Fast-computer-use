@@ -53,6 +53,31 @@ canvas, a layout question. To find out whether a button exists, where it is, or
 what a field contains, `ui_inspect` and `read_text` answer in text and cost a
 fraction of the tokens.
 
+## Dragging
+
+Two correct shapes, and one that looks right but is not:
+
+```json
+{"cmd": "mouse", "action": "drag", "x": 100, "y": 200, "to_x": 400, "to_y": 300}
+```
+
+That is the whole gesture in one step. Use it unless the drag has to pass through
+specific waypoints.
+
+When you do need to steer the path, bracket your own moves:
+
+```json
+{"cmd": "mouse", "action": "mouse_down"},
+{"cmd": "mouse", "action": "move", "x": 250, "y": 250, "smooth": true},
+{"cmd": "mouse", "action": "move", "x": 400, "y": 300, "smooth": true},
+{"cmd": "mouse", "action": "mouse_up"}
+```
+
+The button stays held across every step in between. What does **not** work is
+moving first and clicking at the end: that travels with the button up and then
+clicks, which is not a drag. If a target does not register the grab or the drop
+lands short, raise `grab_ms` / `drop_ms` rather than adding blind `wait` steps.
+
 ## Prefer identity over coordinates
 
 `{"cmd":"ui_click","automation_id":"104"}` and `{"cmd":"ui_click","name":"Save"}`

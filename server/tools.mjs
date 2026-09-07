@@ -79,7 +79,9 @@ export const TOOL_DEFINITIONS = [
             'Ordered steps. Each step names its command with "cmd". Supported steps:\n' +
             '  {"cmd":"launch","app":"notepad","timeout_ms":8000} - start an app (or a document/URI) and wait for its real window; reports an error if the app fails to start\n' +
             '  {"cmd":"window_focus","target":"notepad"} - bring a window to the foreground and confirm it got there\n' +
-            '  {"cmd":"mouse","action":"click","x":100,"y":200} - also double_click, right_click, middle_click, move, drag (to_x/to_y), scroll (scroll_amount)\n' +
+            '  {"cmd":"mouse","action":"click","x":100,"y":200} - also double_click, right_click, middle_click, move, scroll (scroll_amount)\n' +
+            '  {"cmd":"mouse","action":"drag","x":100,"y":200,"to_x":400,"to_y":300} - a whole drag in one step; use this unless you need to move through specific waypoints\n' +
+            '  {"cmd":"mouse","action":"mouse_down"} ... moves ... {"cmd":"mouse","action":"mouse_up"} - a drag you steer yourself. The button STAYS held across the steps in between, so put the moves between them, never a click\n' +
             '  {"cmd":"ui_click","automation_id":"104"} - click an element by automation id or {"name":"Save"}, no coordinates needed\n' +
             '  {"cmd":"keyboard","action":"type_text","text":"hello"} - also paste_text (instant, use it for anything long), hotkey ("ctrl+s"), press_key\n' +
             '  {"cmd":"wait_for","filter":"Save","timeout_ms":5000} - wait until a UI element appears; or {"window":"Notepad"} for a window. Always prefer this over a blind wait\n' +
@@ -198,7 +200,7 @@ export const TOOL_DEFINITIONS = [
   },
   {
     name: 'mouse_action',
-    description: 'One native mouse action. For a sequence of steps use batch_actions instead: one call, no round trip per click.',
+    description: 'One native mouse action. For a sequence of steps use batch_actions instead: one call, no round trip per click. To drag, either use action "drag" with to_x/to_y for the whole gesture, or bracket your own moves with mouse_down and mouse_up - the button stays held between those two, so the moves belong between them.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -214,7 +216,10 @@ export const TOOL_DEFINITIONS = [
         to_x: { type: 'integer', description: 'Destination X for drag.' },
         to_y: { type: 'integer', description: 'Destination Y for drag.' },
         smooth: { type: 'boolean', description: 'Interpolate the movement instead of teleporting the cursor.' },
-        duration_ms: { type: 'integer', description: 'Total travel time for a smooth move (default 40).' }
+        duration_ms: { type: 'integer', description: 'Total travel time for a smooth move (default 40) or a drag (default 200).' },
+        steps: { type: 'integer', description: 'Number of interpolation steps; defaults to a count scaled from the distance.' },
+        grab_ms: { type: 'integer', description: 'Drag only: settle time before pressing the button (default 40). Raise it if a target does not register the grab.' },
+        drop_ms: { type: 'integer', description: 'Drag only: settle time at the destination before releasing (default 60). Raise it if the drop lands short.' }
       },
       required: ['action']
     }

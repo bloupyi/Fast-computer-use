@@ -173,6 +173,34 @@ function hwndOf(launchResult) {
   return toolResultText(launchResult).match(/hwnd=(\d+)/)?.[1] ?? '';
 }
 
+// The launch result names the window it actually opened. Asking the foreground
+// instead is unreliable: a system error dialog from a previous failed launch
+// keeps stealing focus and would be adopted as the scratch window.
+function titleOf(launchResult) {
+  return toolResultText(launchResult).match(/window: "([^"]*)"/)?.[1] ?? '';
+}
+
+// A failed launch can leave a modal "System Error" box grabbing the foreground
+// for the rest of the run. Close it before doing anything else.
+async function dismissStartupErrorDialogs(client) {
+  for (let i = 0; i < 4; i++) {
+    const list = toolResultText(await client.callTool('window_manager', { action: 'list' }));
+    const line = list.split('\n').find((l) => /System Error/i.test(l));
+    if (!line) return;
+    const hwnd = line.match(/hwnd=(\d+)/)?.[1];
+    if (!hwnd) return;
+    await client.callTool('window_manager', { action: 'close', target: hwnd });
+    await sleep(400);
+  }
+}
+
+function rectOf(listText, hwnd) {
+  const line = listText.split('\n').find((l) => l.includes(`hwnd=${hwnd} `));
+  if (!line) return null;
+  const m = line.match(/at \((-?\d+),(-?\d+)\)/);
+  return m ? [m[0], m[1], m[2]] : null;
+}
+
 async function openScratchApp(client) {
   const np = await client.callTool('app_launch', {
     app: 'notepad', reuse_existing: false, timeout_ms: 8000
@@ -197,6 +225,7 @@ async function openScratchApp(client) {
     note(`Notepad opened but gave "${title}" instead of a blank tab; using Character Map instead`);
   } else {
     note(`ENVIRONMENT: Notepad cannot start on this host, falling back to Character Map. ${toolResultText(np).slice(0, 160)}`);
+    await dismissStartupErrorDialogs(client);
   }
 
   const cm = await client.callTool('app_launch', {
@@ -204,7 +233,7 @@ async function openScratchApp(client) {
   }, 40000);
   if (cm.isError) throw new Error(`no usable scratch app: ${toolResultText(cm)}`);
 
-  const title = await getActiveWindowTitle(client);
+  const title = titleOf(cm);
   return {
     kind: 'charmap',
     title,
@@ -502,6 +531,63 @@ async function main() {
     assert(badVerify.isError && /1 failed/.test(toolResultText(badVerify)),
       'a step whose verification fails is reported as failed');
 
+    // 11c. A real drag: press, move while held, release. mouse_down and mouse_up
+    // were advertised but had no engine handler, so each performed a full click
+    // and the button was never actually held - the cursor travelled and nothing
+    // was dragged. Proven by moving our own window with its title bar.
+    await client.callTool('window_manager', {
+      action: 'set_pos', target: wmTarget, x: 320, y: 320, width: 600, height: 480
+    });
+    await sleep(300);
+    const beforeList = toolResultText(await client.callTool('window_manager', { action: 'list' }));
+    const beforeRect = rectOf(beforeList, scratch.hwnd);
+    if (beforeRect) {
+      const bx = Number(beforeRect[1]);
+      const by = Number(beforeRect[2]);
+      const grabX = bx + 300;
+      const grabY = by + 14;
+      const dragBatch = await client.callTool('batch_actions', {
+        actions: [
+          { cmd: 'mouse', action: 'move', x: grabX, y: grabY },
+          { cmd: 'mouse', action: 'mouse_down', button: 'left' },
+          { cmd: 'mouse', action: 'move', x: grabX + 90, y: grabY + 40, smooth: true },
+          { cmd: 'mouse', action: 'move', x: grabX + 180, y: grabY + 80, smooth: true },
+          { cmd: 'wait', ms: 60 },
+          { cmd: 'mouse', action: 'mouse_up', button: 'left' }
+        ]
+      }, 40000);
+      assert(/mouse_down/.test(toolResultText(dragBatch)) && !dragBatch.isError,
+        'batch_actions runs mouse_down / mouse_up as real press and release');
+
+      await sleep(400);
+      const afterList = toolResultText(await client.callTool('window_manager', { action: 'list' }));
+      const afterRect = rectOf(afterList, scratch.hwnd);
+      const dx = afterRect ? Number(afterRect[1]) - bx : 0;
+      const dy = afterRect ? Number(afterRect[2]) - by : 0;
+      assert(Math.abs(dx - 180) < 30 && Math.abs(dy - 80) < 30,
+        'the button stays held between mouse_down and mouse_up (window really dragged)',
+        `moved by (${dx},${dy}), expected (180,80)`);
+    } else {
+      note('drag check skipped: could not read the scratch window rect');
+    }
+
+    // 11d. The one-shot drag action moves the window the same way.
+    const beforeList2 = toolResultText(await client.callTool('window_manager', { action: 'list' }));
+    const r2 = rectOf(beforeList2, scratch.hwnd);
+    if (r2) {
+      const bx = Number(r2[1]);
+      const by = Number(r2[2]);
+      await client.callTool('mouse_action', {
+        action: 'drag', x: bx + 300, y: by + 14, to_x: bx + 300 - 150, to_y: by + 14 - 60
+      }, 40000);
+      await sleep(400);
+      const a2 = rectOf(toolResultText(await client.callTool('window_manager', { action: 'list' })), scratch.hwnd);
+      const dx = a2 ? Number(a2[1]) - bx : 0;
+      const dy = a2 ? Number(a2[2]) - by : 0;
+      assert(Math.abs(dx + 150) < 30 && Math.abs(dy + 60) < 30,
+        'mouse_action drag really drags', `moved by (${dx},${dy}), expected (-150,-60)`);
+    }
+
     // 12. The headline scenario, in ONE call: put text in the scratch window
     // and prove it is there, with no screenshot and no intermediate round trip.
     const scenarioText = 'hello world';
@@ -519,7 +605,7 @@ async function main() {
     const scenarioText2 = toolResultText(scenario);
     assert(!scenario.isError && /matched=true/.test(scenarioText2),
       `end-to-end scenario (focus, click, type, verify) in one batch_actions call`,
-      `${elapsed}ms wall`);
+      `${elapsed}ms wall | ${scenarioText2.split('\n').slice(0, 3).join(' // ')}`);
     assert(elapsed < 5000, 'end-to-end scenario completes in under 5s', `${elapsed}ms`);
 
   } catch (err) {
