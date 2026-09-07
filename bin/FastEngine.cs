@@ -197,11 +197,11 @@ namespace FastComputerUse {
                 return;
             }
 
-            Console.WriteLine("FastEngine v1.0.0. Usage: FastEngine.exe --daemon OR FastEngine.exe <cmd> '<json_payload>'");
+            Console.WriteLine("FastEngine v1.1.0. Usage: FastEngine.exe --daemon OR FastEngine.exe <cmd> '<json_payload>'");
         }
 
         static void RunDaemon() {
-            Console.WriteLine("{\"ready\":true,\"version\":\"1.0.0\"}");
+            Console.WriteLine("{\"ready\":true,\"version\":\"1.1.0\"}");
             Console.Out.Flush();
 
             string line;
